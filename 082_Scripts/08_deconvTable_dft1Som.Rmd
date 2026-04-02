@@ -1,0 +1,1009 @@
+---
+title: "08_deconvTable_readVariants"
+author: "IMEV2"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# 0 Environment
+## 0.1 Packages
+### 0.1.1 Library
+```{r echo=F, message=F, warning=FALSE}
+set.seed(123)
+library(tidyverse)
+library(openxlsx)
+library(dplyr)
+library(ggrepel)
+library(RColorBrewer)
+library(pheatmap)
+library(data.table)
+library(GenomicFeatures)
+library(noisyr)
+library(rtracklayer)
+library(GenomicRanges)
+```
+
+## 0.2 Paths
+```{r echo=F, message=FALSE, warning=FALSE}
+wDir <- paste0("~/gitClones/08_deconvTable/")
+fprefix <- "08_deconvTable_dft1Som"
+dataDir <- paste0(wDir, "/081_Data/")
+resDir <- paste0(wDir, "/083_Results/")
+dir.create(resDir)
+plotDir <- paste0(wDir, "/084_Plots/", fprefix, "/")
+dir.create(plotDir)
+```
+
+## 0.3 Custom functions
+### 0.3.1 Compute tAlt
+```{r}
+computeTAlt <- function(obsVaf, 
+                         purityTumor, 
+                         tTotal, 
+                         hTotal, 
+                         hAlt) {
+  
+  # Cases where hAlt = 0, solve for tAlt
+    print("Solving for tAlt.")
+    denominator = purityTumor*tTotal + (1-purityTumor)*hTotal
+    tAlt = (obsVaf*denominator)/purityTumor
+    # returnVal = tAlt
+  
+  # # Cases where tAlt = 0, solve for hAlt
+  # if(is.na(hAlt)==T & tAlt == 0){
+  #   print("Solving for hAlt.")
+  #   denominator = purityTumor*tTotal + (1-purityTumor)*hTotal
+  #   hAlt = (obsVaf*denominator)/purityTumor
+  #   returnVal = hAlt
+  # }
+  # 
+  # return(list(tAlt = tAlt, 
+  #             ))
+  return(tAlt)
+}
+
+computeHAlt <- function(obsVaf, 
+                         purityTumor, 
+                         tTotal, 
+                         tAlt,
+                         hTotal) {
+  
+  # Cases where hAlt = 0, solve for tAlt
+ 
+    print("Solving for tAlt.")
+    denominator = purityTumor*tTotal + (1-purityTumor)*hTotal
+    hAlt = (obsVaf*denominator)/(1-purityTumor)
+    # returnVal = tAlt
+
+  
+  # # Cases where tAlt = 0, solve for hAlt
+  # if(is.na(hAlt)==T & tAlt == 0){
+  #   print("Solving for hAlt.")
+  #   denominator = purityTumor*tTotal + (1-purityTumor)*hTotal
+  #   hAlt = (obsVaf*denominator)/purityTumor
+  #   returnVal = hAlt
+  # }
+  # 
+  # return(list(tAlt = tAlt, 
+  #             ))
+  return(hAlt)
+}
+
+computeTAlt(obsVaf = 0.2, 
+            purityTumor = 0.8, 
+            tTotal = 4, 
+            hTotal = 2, 
+            hAlt=0)
+```
+
+# 1 Data
+## 1.1 VCF files
+### 1.1.1 DFT1 somatic variants
+- VCF file
+```{r}
+dft1Som <- read_table(paste0(dataDir, "Data_S1A_DFT1_somatic_variants.txt"), 
+                      col_types = cols(.default = "c"))
+
+dft1SomLong <- dft1Som %>%
+  pivot_longer(
+    cols = -c(CHROM, POS, REF, ALT),
+    names_to = "tumor",
+    values_to = "ratio"
+  ) %>%
+  mutate(chrom = as.character(CHROM), 
+         location = paste0(CHROM, ":", POS), 
+         position = as.numeric(POS)) %>%
+  filter(nchar(REF) == 1, nchar(ALT) == 1) 
+
+rm(dft1Som)
+gc()
+```
+
+### 1.1.2 DFT2 somatic variants
+```{r}
+# dft2Som <- read_table(paste0(dataDir, "Data_S1B_DFT2_somatic_variants.txt"),
+#                       col_types = cols(.default = "c"))
+# dft2SomLong <- dft2Som %>%
+#   pivot_longer(
+#     cols = -c(CHROM, POS, REF, ALT),
+#     names_to = "tumor",
+#     values_to = "ratio"
+#   ) %>%
+#   mutate(chrom = as.character(CHROM),
+#          location = paste0(CHROM, ":", POS),
+#          position = as.numeric(POS)) %>%
+#   filter(nchar(REF) == 1, nchar(ALT) == 1)
+# 
+# rm(dft2Som)
+# gc()
+```
+
+### 1.1.3 Germline variants
+```{r}
+# germline <- read_table(paste0(dataDir, "Data_S1D_Tasmanian_devil_germline_variants.txt"),
+#                       col_types = cols(.default = "c"))
+# 
+# germlineLong <- head(germline) %>%
+#   as.data.frame() %>%
+#   pivot_longer(
+#     cols = -c(CHROM, POS, REF, ALT),
+#     names_to = "sample",
+#     values_to = "ratio"
+#   ) %>%
+#   mutate(chrom = as.character(CHROM),
+#          location = paste0(CHROM, ":", POS),
+#          position = as.numeric(POS)) %>%
+#   filter(nchar(REF) == 1, nchar(ALT) == 1)
+# 
+# rm(germline)
+# gc()
+```
+
+
+## 1.2 CNVs
+### 1.2.1 DFT1
+```{r}
+dft1Cnv <- read.xlsx("~/gitClones/07_suppDataPapers/suppScienceMax/science.abq6453_tables_s1_to_s8/science.abq6453_table_s6.xlsx", 
+                     sheet = "Table S6B", 
+                     startRow = 3)
+
+dft1CnvLong <- dft1Cnv %>%
+  pivot_longer(-c(1:12),
+              names_to = "tumor", 
+              values_to = "presence") %>%
+  mutate(presence = as.numeric(presence)) %>%
+  mutate(
+    START = as.numeric(START),
+    END = as.numeric(END),
+    CHROM = as.character(CHROM),
+    tumor = as.character(tumor)
+  )
+
+rm(dft1Cnv)
+gc()
+```
+
+
+## 1.3 Purities
+```{r}
+dft1Purities <- read.xlsx("~/gitClones/07_suppDataPapers/suppScienceMax/science.abq6453_tables_s1_to_s8/science.abq6453_table_s2.xlsx", 
+                          sheet = 1, 
+                          startRow = 3)
+
+firstRow <- as.character(dft1Purities[1, ])
+
+# Create new column names
+newNames <- ifelse(
+  is.na(firstRow),
+  colnames(dft1Purities),
+  paste0(colnames(dft1Purities), "_", firstRow)
+)
+
+# Assign new names and remove the first row
+colnames(dft1Purities) <- newNames
+dft1Purities <- dft1Purities[-1, ]
+```
+
+## 1.4 Allele counter data
+- Check for which tumors + hosts we have run alleleCounter (i.e., for which samples do we have RNAseq)?
+- Capital R = TR
+- a/b = BR
+- Adjust names using metadata! 
+
+### 1.4.1 Metadata
+- Mapping AlCo results to VCF file names
+- FOR now, filter where mapping = 1. There are sample names that I am certain match the name in Max's supplementary table. 
+- Go back and check once workflow is done
+```{r}
+metadata <- read.xlsx(paste0(resDir,
+                          "08_deconvTable_metadata_purityIrodsMergedManualEdit.xlsx")) %>%
+  filter(mapping==1)  %>%
+              dplyr::rename("tumorId"="TUMOUR.INFORMATION_TUMOUR.ID", 
+                     "tumorIdRnaSeq"="rnaSeqManual")
+```
+
+### 1.4.2 DFT1
+#### 1.4.2.1 Read in AlCo results
+```{r}
+dft1SomAlCo <- list.files(paste0(resDir, "/063_Results/06_deconvTable_alCo_dft1SomRefAltExport"), 
+                          recursive = T)
+
+# Read all files and combine
+dft1SomAlCoDf <- rbindlist(lapply(dft1SomAlCo, function(f) {
+  # Extract tumor ID between "dft1SomRefAltExport_" and "_realigned"
+  tumorId <- sub(".*dft1SomRefAltExport_(.+)_realigned.*", "\\1", basename(f))
+  
+  # Read file
+  dt <- fread(paste0(resDir, "/063_Results/06_deconvTable_alCo_dft1SomRefAltExport/", f),
+              select = c("CHROM", "POS", "REF", "ALT", "TOTAL", "NREF", "NALT"))
+  
+  # Add tumor ID column
+  dt[, tumorId := tumorId]
+  
+  return(dt)
+})) 
+
+length(unique(dft1SomAlCoDf$tumorId))
+```
+#### 1.4.2.2 Adjust tumorId of RNAseq data to match Max's metadata
+- Make tumorId the metadata id.
+- Save RNAseq data name.
+- Adjust tumorLocationAlt
+```{r}
+dft1SomAlCoCombined <- dft1SomAlCoDf %>%
+  filter(tumorId %in% metadata$tumorIdRnaSeq) %>%
+  left_join(metadata %>%
+              dplyr::select(tumorId,
+                            tumorIdRnaSeq)) %>%
+  mutate(tumorLocation = paste0(tumorId, "_", CHROM, ":", POS), 
+         tumorLocationAlt = paste0(tumorId, "_", CHROM, ":", POS, "_", ALT))
+
+length(unique(dft1SomAlCoCombined$tumorId))
+```
+
+# 2 Filter data
+- Only variants for which the alternate allele is found exclusively in one of the samples (host or tumor), in at least one host-tumor pair.
+- The same variant in each single host-tumor pair is considered independent (independent CNV + tumor purity value associated)
+#===
+<!-- ## 2.1 Toy example - 46T (diploid) -->
+<!-- - Checking DFT1 mutations in 18T -->
+<!-- - dft1Som --> By default the SNVs in dft1Som file are not present in any of the hosts -->
+<!-- - germline --> filter where alternative allele is exclusive to host or tumor in a matched pair -->
+<!-- - for tetraploid!!! --> trickier because we have pre and post tetraploidization CNVs?? -->
+<!-- - to check, use vaf based purity or cnv based purity? -->
+<!-- - to check, is the presence/absence the degree of cnv too? only had 0/1 so can't see if loss both copies?? -->
+
+<!-- - if a variant falls in a region where cnv changes with presence = 1 multiple times, how do I account for this? --> sum up gains + losses! -->
+<!-- - how to account for sex chromosomes? assume diploid for tumor, except in sex chromosomes! Y -->
+<!-- ```{r} -->
+<!-- toy <- "46T1" -->
+<!-- ``` -->
+
+<!-- ### 2.1.1 VCF + Purities + Ploidy -->
+<!-- - Merge info on purity and ploidy from metadata -->
+<!-- - Create seperate columns for Alt/Total -->
+<!-- - Filter out Alt > 0, this variant was not present in the tumor (reduces the size of the table). -->
+<!-- ```{r} -->
+<!-- dft1PuritiesPloidy <- dft1Purities %>% -->
+<!--   filter(`TUMOUR.INFORMATION_TUMOUR ID`==toy) %>% -->
+<!--   mutate(ploidy = ifelse(X15_PLOIDY == "diploid", -->
+<!--                  2,  -->
+<!--                  ifelse(X15_PLOIDY == "tetraploid",  -->
+<!--                         4,  -->
+<!--                         "toCheck"))) %>% -->
+<!--   filter(ploidy != "toCheck") -->
+
+
+<!-- dft1SomLongVaf <- dft1SomLong %>% -->
+<!--   filter(tumor==toy) %>% -->
+<!--   mutate( -->
+<!--     Alt = as.integer(sub("/.*", "", ratio)), -->
+<!--     Total = as.integer(sub(".*/", "", ratio)) -->
+<!--   ) %>% -->
+
+<!--   # If nAlt = 0, this was a variant in a different tumor sample, so filter out any 0 vafs! -->
+<!--   filter(Alt > 0) %>% -->
+<!--   left_join(dft1PuritiesPloidy %>% -->
+<!--               dplyr::rename("tumor"="TUMOUR.INFORMATION_TUMOUR ID",  -->
+<!--                      "purity"="X14_PURITY (VAF-based)") %>% -->
+<!--               mutate(purity = as.numeric(purity)) %>% -->
+<!--               dplyr::select(tumor,  -->
+<!--                             ploidy,  -->
+<!--                             purity)) %>% -->
+<!--   filter(tumor %in% dft1PuritiesPloidy$`TUMOUR.INFORMATION_TUMOUR ID`) %>% -->
+<!--   mutate( -->
+<!--     position = as.numeric(position), -->
+<!--     CHROM = as.character(CHROM), -->
+<!--     tumor = as.character(tumor) -->
+<!--   ) -->
+<!-- ``` -->
+
+<!-- ### 2.1.2 Adjust ploidy at variant using CNV status.  -->
+<!-- - Per variant per tumor, find all CNV events spanning that position -->
+<!-- - This means that if you filter for presence > 0, there is a change in tumor CN.  -->
+<!-- - For some variants, there may be more than one change in CN, to check which these are, filter for the rows where this is the case.  -->
+<!-- ```{r} -->
+<!-- cnvJoin <- dft1SomLongVaf %>% -->
+<!--   left_join( -->
+<!--     dft1CnvLong, -->
+<!--     by = join_by( -->
+<!--       CHROM, -->
+<!--       tumor, -->
+<!--       position >= START, -->
+<!--       position <= END -->
+<!--     ) -->
+<!--   ) %>% -->
+<!--   filter(presence > 0) %>% -->
+<!--   distinct() %>% -->
+<!--   mutate(tumorLocation = paste0(tumor, "_", location)) -->
+
+<!-- check <- which(table(cnvJoin$tumorLocation)>1) -->
+
+<!-- cnvJoinMultiplets <- cnvJoin %>% -->
+<!--   mutate(multiplets = ifelse(tumorLocation %in% names(check),  -->
+<!--                 "1",  -->
+<!--                 "0"))  -->
+
+<!-- write.xlsx(cnvJoinMultiplets,  -->
+<!--            paste0(resDir, fprefix, "_cnvJoinMultiplets_46T.xlsx")) -->
+
+
+<!-- ### Double checking ### -->
+<!-- dft1CnvToy <- dft1Cnv %>% -->
+<!--   dplyr::select(1:12, toy) %>% -->
+<!--   filter(CNV.EVENT.ID %in% (cnvJoinMultiplets %>%  -->
+<!--            filter(multiplets == 1) %>%  -->
+<!--            pull(CNV.EVENT.ID))) -->
+<!-- ``` -->
+
+
+
+
+
+
+
+
+
+
+
+
+<!-- #=== -->
+<!-- ## 2.2 Toy example.- 18T (tetraploid) -->
+<!-- ```{r} -->
+<!-- toy <- "18T" -->
+<!-- ``` -->
+<!-- ### 2.2.1 VCF + Purities + Ploidy -->
+<!-- - Merge info on purity and ploidy from metadata -->
+<!-- - Create seperate columns for Alt/Total -->
+<!-- - Filter out Alt > 0, this variant was not present in the tumor (reduces the size of the table). -->
+<!-- ```{r} -->
+<!-- dft1PuritiesPloidy <- dft1Purities %>% -->
+<!--   filter(`TUMOUR.INFORMATION_TUMOUR ID`==toy) %>% -->
+<!--   mutate(ploidy = ifelse(X15_PLOIDY == "diploid", -->
+<!--                  2,  -->
+<!--                  ifelse(X15_PLOIDY == "tetraploid",  -->
+<!--                         4,  -->
+<!--                         "toCheck"))) %>% -->
+<!--   filter(ploidy != "toCheck") -->
+
+
+<!-- dft1SomLongVaf <- dft1SomLong %>% -->
+<!--   filter(tumor==toy) %>% -->
+<!--   mutate( -->
+<!--     Alt = as.integer(sub("/.*", "", ratio)), -->
+<!--     Total = as.integer(sub(".*/", "", ratio)) -->
+<!--   ) %>% -->
+
+<!--   # If nAlt = 0, this was a variant in a different tumor sample, so filter out any 0 vafs! -->
+<!--   filter(Alt > 0) %>% -->
+<!--   left_join(dft1PuritiesPloidy %>% -->
+<!--               dplyr::rename("tumor"="TUMOUR.INFORMATION_TUMOUR ID",  -->
+<!--                      "purity"="X14_PURITY (VAF-based)") %>% -->
+<!--               mutate(purity = as.numeric(purity)) %>% -->
+<!--               dplyr::select(tumor,  -->
+<!--                             ploidy,  -->
+<!--                             purity)) %>% -->
+<!--   filter(tumor %in% dft1PuritiesPloidy$`TUMOUR.INFORMATION_TUMOUR ID`) %>% -->
+<!--   mutate( -->
+<!--     position = as.numeric(position), -->
+<!--     CHROM = as.character(CHROM), -->
+<!--     tumor = as.character(tumor) -->
+<!--   ) -->
+<!-- ``` -->
+
+<!-- ### 2.2.2 Adjust ploidy at variant using CNV status.  -->
+<!-- - Per variant per tumor, find all CNV events spanning that position -->
+<!-- - This means that if you filter for presence > 0, there is a change in tumor CN.  -->
+<!-- - For some variants, there may be more than one change in CN, to check which these are, filter for the rows where this is the case.  -->
+<!-- ```{r} -->
+<!-- cnvJoin <- dft1SomLongVaf %>% -->
+<!--   left_join( -->
+<!--     dft1CnvLong, -->
+<!--     by = join_by( -->
+<!--       CHROM, -->
+<!--       tumor, -->
+<!--       position >= START, -->
+<!--       position <= END -->
+<!--     ) -->
+<!--   ) %>% -->
+<!--   filter(presence > 0) %>% -->
+<!--   distinct() %>% -->
+<!--   mutate(tumorLocation = paste0(tumor, "_", location)) -->
+
+<!-- check <- which(table(cnvJoin$tumorLocation)>1) -->
+
+<!-- cnvJoinMultiplets <- cnvJoin %>% -->
+<!--   mutate(multiplets = ifelse(tumorLocation %in% names(check),  -->
+<!--                 "1",  -->
+<!--                 "0"))  -->
+
+<!-- write.xlsx(cnvJoinMultiplets,  -->
+<!--            paste0(resDir,  -->
+<!--                   fprefix,  -->
+<!--                   "_cnvJoinMultiplets_18T.xlsx")) -->
+
+<!-- ### Double checking ### -->
+<!-- dft1CnvToy <- dft1Cnv %>% -->
+<!--   dplyr::select(1:12, toy) %>% -->
+<!--   filter(CNV.EVENT.ID %in% (cnvJoinMultiplets %>%  -->
+<!--            filter(multiplets == 1) %>%  -->
+<!--            pull(CNV.EVENT.ID))) -->
+<!-- ``` -->
+# Uncomment for toy example.
+#===
+## 2.1 VCF + Purities + Ploidy
+- Merge info on purity and ploidy from metadata
+- Create seperate columns for Alt/Total
+- Filter out Alt > 0, this variant was not present in the tumor (reduces the size of the table).
+```{r}
+dft1PuritiesPloidy <- dft1Purities %>%
+  mutate(ploidy = ifelse(X15_PLOIDY == "diploid",
+                 2, 
+                 ifelse(X15_PLOIDY == "tetraploid", 
+                        4, 
+                        "toCheck"))) %>%
+  filter(ploidy != "toCheck")
+
+
+dft1SomLongVaf <- dft1SomLong %>%
+  mutate(
+    Alt = as.integer(sub("/.*", "", ratio)),
+    Total = as.integer(sub(".*/", "", ratio))
+  ) %>%
+  # If nAlt = 0, this was a variant in a different tumor sample, so filter out any 0 vafs!
+  filter(Alt > 0) %>%
+  left_join(dft1PuritiesPloidy %>%
+              dplyr::rename("tumor"="TUMOUR.INFORMATION_TUMOUR ID", 
+                     "purity"="X14_PURITY (VAF-based)") %>%
+              mutate(purity = as.numeric(purity)) %>%
+              dplyr::select(tumor, 
+                            ploidy, 
+                            purity)) %>%
+  filter(tumor %in% dft1PuritiesPloidy$`TUMOUR.INFORMATION_TUMOUR ID`) %>%
+  mutate(
+    position = as.numeric(position),
+    CHROM = as.character(CHROM),
+    tumor = as.character(tumor)
+  ) 
+```
+
+## 2.2 Adjust ploidy at variant using CNV status. 
+- Per variant per tumor, find all CNV events spanning that position
+- This means that if you filter for presence > 0, there is a change in tumor CN. 
+- For some variants, there may be more than one change in CN, to check which these are, filter for the rows where this is the case. 
+### 2.2.1 Find multiplets
+```{r}
+dft1CnvJoin <- dft1SomLongVaf %>%
+  left_join(
+    dft1CnvLong,
+    by = join_by(
+      CHROM,
+      tumor,
+      position >= START,
+      position <= END
+    )
+  ) %>%
+  filter(presence > 0) %>%
+  distinct() %>%
+  mutate(tumorLocation = paste0(tumor, 
+                                "_", 
+                                location),
+         tumorLocationAlt = paste0(tumor, 
+                                "_", 
+                                location, 
+                                "_", 
+                                ALT)) 
+
+# Tumor_position combinations where there is more than one CNV event
+check <- which(table(dft1CnvJoin$tumorLocation)>1)
+checkAlt <- which(table(dft1CnvJoin$tumorLocationAlt)>1)
+
+## Reconstruct table but keep all variants, even when presence == 0, because these are instances where no CNV exists at that variant. 
+dft1CnvJoinMultiplets <- dft1SomLongVaf %>%
+  left_join(
+    dft1CnvLong,
+    by = join_by(
+      CHROM,
+      tumor,
+      position >= START,
+      position <= END
+    )
+  ) %>%
+  # filter(presence > 0) %>%
+  distinct() %>%
+  mutate(tumorLocation = paste0(tumor, 
+                                "_", 
+                                location), 
+         tumorLocationAlt = paste0(tumor, 
+                                "_", 
+                                location, 
+                                "_", 
+                                ALT))  %>%
+  mutate(multiplets = ifelse(tumorLocation %in% names(check), 
+                1, 
+                0), 
+         multipletsAlt = ifelse(tumorLocationAlt %in% names(checkAlt), 
+                1, 
+                0)) %>%
+  mutate(variantType = "dft1Som") 
+
+## File is too large to save.
+# write.xlsx(dft1CnvJoinMultiplets %>% filter(presence > 0), 
+#            paste0(resDir, 
+#                   fprefix, 
+#                   "_dft1CnvJoinMultiplets.xlsx"))
+
+rm(dft1CnvJoin)
+gc()
+
+# Special cases where looked like a multiplet, but this is actually because there are two different variants at the same position in the same tumor!
+# checkMulti <- dft1CnvJoinMultiplets %>% 
+#   filter(multiplets == "1" & multipletsAlt == "0" & presence > 0)
+```
+
+### 2.2.2 Test function for detecting multiple possible CN states
+```{r}
+possible_cn_absorbing <- function(start_cn, nGain, nLoss) {
+  # Each state is a pair: CN, remaining events (gains and losses)
+  states <- list(list(cn = start_cn, g = nGain, l = nLoss))
+  
+  final_cns <- c()
+  
+  while (length(states) > 0) {
+    new_states <- list()
+    
+    for (s in states) {
+      cn <- s$cn
+      g  <- s$g
+      l  <- s$l
+      
+      if (cn == 0 || (g == 0 && l == 0)) {
+        # CN is 0 (absorbing) or no events left → record final CN
+        final_cns <- c(final_cns, cn)
+      } else {
+        # Apply a gain if available
+        if (g > 0 && cn > 0) {
+          new_states <- append(new_states, list(list(cn = cn + 1, g = g - 1, l = l)))
+        }
+        # Apply a loss if available
+        if (l > 0) {
+          new_cn <- max(0, cn - 1)
+          new_states <- append(new_states, list(list(cn = new_cn, g = g, l = l - 1)))
+        }
+      }
+    }
+    
+    states <- new_states
+  }
+  sort(unique((final_cns)))
+}
+
+possible_cn_absorbing(3, 2, 3)
+
+# # Filter on variants where I know ploidy = 2 and nGain = 1 and nLoss = 2. This is because this should lead to two possible final copy numbers (1 or 0).
+# dft1Test <- dft1CnvJoinMultiplets %>%
+#   
+#   mutate(ploidy = as.numeric(ploidy)) %>%
+#   
+#   group_by(tumorLocationAlt) %>%
+#   
+#   filter(multipletsAlt == 1 & presence > 0) %>%
+#   
+#   mutate(
+#     nGain = sum(EVENT.TYPE == "GAIN"),
+#     nLoss = sum(EVENT.TYPE == "LOSS"),
+#     nGainPost = sum(EVENT.TYPE == "GAIN (post-tetraploidisation)"),
+#     nGainPre = sum(EVENT.TYPE == "GAIN (pre-tetraploidisation)"),
+#     nLossPost = sum(EVENT.TYPE == "LOSS (post-tetraploidisation)"),
+#     nLossPre = sum(EVENT.TYPE == "LOSS (pre-tetraploidisation)")
+#   ) %>%
+#   
+#   dplyr::select(-c(setdiff(colnames(dft1CnvLong), "tumor"))) %>%
+#   distinct() %>%
+#   rowwise()  %>% 
+#   filter(ploidy == 3 & nGain == 1 & nLoss == 2) 
+# 
+# # Test functions
+# dft1TestFunction <- dft1Test %>%
+#   
+#   mutate(
+#     # ---- CASE 1: diploid ----
+#     possibleCN = list(
+#       if (ploidy == 2) {
+#         possible_cn_absorbing(ploidy, nGain, nLoss)
+#         
+#       # ---- CASE 2: tetraploid with pre-events ----
+#       } else if (ploidy == 4 & (nGainPre > 0 | nLossPre > 0)) {
+#         
+#         pre_cn <- possible_cn_absorbing(2, nGainPre, nLossPre)
+#         pre_cn <- pre_cn * 2
+#         
+#         # apply post events to each possible pre state
+#         unique(unlist(
+#           lapply(pre_cn, function(cn) {
+#             possible_cn_absorbing(
+#               cn,
+#               nGain + nGainPost,
+#               nLoss + nLossPost
+#             )
+#           })
+#         ))
+#         
+#       # ---- CASE 3: tetraploid without pre-events ----
+#       } else if (ploidy == 4) {
+#         
+#         possible_cn_absorbing(
+#           ploidy,
+#           nGain + nGainPost,
+#           nLoss + nLossPost
+#         )
+#         
+#       } else {
+#         NA_real_
+#       }
+#     ),
+#     
+#     minCN = min(possibleCN),
+#     maxCN = max(possibleCN)
+#     
+#   ) %>%
+#   ungroup() %>%
+#   mutate(cnvAdjAnno = "multipleChangesTest")
+```
+
+### 2.2.3 Variants with no change
+- copyNumberAdjusted = ploidy
+- number of unique variants (taking into account alt) = number of rows, because no changes to cnv. YES? --> multiallelic variants possible (i.e., subclones, because these variants don't occur in any of the host samples.)
+```{r}
+dft1CnvJoinNoChanges <- dft1CnvJoinMultiplets %>%
+  # Group by tumorLocation. If all rows presence = 0 (and, by default, not a multiplet), no change to CNV. 
+  group_by(tumorLocationAlt) %>%
+  filter(multipletsAlt == 0 & all(presence==0)) %>%
+  mutate(
+    nGain = sum(EVENT.TYPE == "GAIN"),
+    nLoss = sum(EVENT.TYPE == "LOSS"),
+    nGainPost = sum(EVENT.TYPE == "GAIN (post-tetraploidisation)"),
+    nGainPre = sum(EVENT.TYPE == "GAIN (pre-tetraploidisation)"),
+    nLossPost = sum(EVENT.TYPE == "LOSS (post-tetraploidisation)"),
+    nLossPre = sum(EVENT.TYPE == "LOSS (pre-tetraploidisation)"), 
+    sumPresence = sum(presence)
+  ) %>%
+  ungroup() %>%
+  mutate(copyNumberAdjusted = ploidy) %>%
+  # remove CNV table columns
+  dplyr::select(-c(setdiff(colnames(dft1CnvLong),
+                           "tumor"))) %>%
+  mutate(cnvAdjAnno = "noChanges")
+
+# # length(unique(dft1CnvJoinNoChanges$tumorLocation))==nrow(dft1CnvJoinNoChanges)
+# checkNoChange <- names(which(table(dft1CnvJoinNoChanges$tumorLocation)>1)) # 15 samples. This is because there are no changes, but you get duplicate rows if there is a diff Alt allele. 
+# checkNoChangeAlt <- names(which(table(dft1CnvJoinNoChanges$tumorLocationAlt)>1)) # 0 samples. 
+```
+
+### 2.2.4 Variants with single change
+- change ploidy according to single step
+- number of unique variants = number of rows, because only 1 change to cnv per variant. 5 tumorLocation where more than one variant with a single CNV change.
+- All presences should be 1 because single change
+- If CN goes to 0, it should stay at 0. (Applies for multistep, not here.) Running same code as multiplets as a sanity check, none of the maxCn should differ from minCn. 
+```{r}
+dft1CnvJoinSingleChange <- dft1CnvJoinMultiplets %>%
+  mutate(ploidy=as.numeric(ploidy)) %>%
+  filter(presence != 0 & multipletsAlt == 0) %>%
+  group_by(tumorLocationAlt) %>%
+  mutate(
+    nGain = sum(EVENT.TYPE == "GAIN"),
+    nLoss = sum(EVENT.TYPE == "LOSS"),
+    nGainPost = sum(EVENT.TYPE == "GAIN (post-tetraploidisation)"),
+    nGainPre = sum(EVENT.TYPE == "GAIN (pre-tetraploidisation)"),
+    nLossPost = sum(EVENT.TYPE == "LOSS (post-tetraploidisation)"),
+    nLossPre = sum(EVENT.TYPE == "LOSS (pre-tetraploidisation)"),
+    sumPresence = sum(presence)
+  ) %>%
+   # remove CNV table columns, because this has been aggregated by summing rows.
+  dplyr::select(-c(setdiff(colnames(dft1CnvLong),
+                           "tumor"))) %>%
+  mutate(
+    copyNumberAdjusted = pmax(0,
+    case_when(
+      # Case 1: diploid
+      ploidy == 2 ~ ploidy + nGain - nLoss,
+      
+      # Case 2: tetraploid with pre-tetra events present
+      ploidy == 4 & (nGainPre > 0 | nLossPre > 0) ~ 
+        (2 + nGainPre - nLossPre) * 2 + 
+        (nGain + nGainPost) - (nLoss + nLossPost),
+      
+      # Case 3: tetraploid without pre-tetra events present
+      ploidy == 4 & nGainPre == 0 & nLossPre == 0 ~
+        ploidy + (nGain + nGainPost) - (nLoss + nLossPost),
+      
+      TRUE ~ NA_real_
+    )
+   )
+  ) %>%
+  mutate(cnvAdjAnno = "singleChange")
+  
+checkSingle <- names(which(table(dft1CnvJoinSingleChange$tumorLocation)>1)) # 0 
+checkAltSingle <- names(which(table(dft1CnvJoinSingleChange$tumorLocationAlt)>1)) # 0 
+```
+
+### 2.2.5 Variants with multiple changes
+- Aggregate steps using same logic as before, only this time ploidy will change using sum of all steps rather than single change of CNV status.
+- Issue: we don't know the order of events. Depending on order of losses and gains, the final CN could differ. Adding a permutation function which returns how many times a different final CN state could occur. 
+- None of the tetraploid tumors have nLossPre > 1, therefore cannot go to 0.
+- The only variable cases are diploid tumors whose variants have two losses and one gain. 
+- Filter out the five variants that could have been CN 0 or 1!
+  - Check these variants against the counts + gtf file.
+```{r}
+dft1CnvJoinMultipleChanges <- dft1CnvJoinMultiplets %>%
+  
+  mutate(ploidy = as.numeric(ploidy)) %>%
+  
+  group_by(tumorLocationAlt) %>%
+  
+  filter(multipletsAlt == 1 & presence > 0) %>%
+  
+  mutate(
+    nGain = sum(EVENT.TYPE == "GAIN"),
+    nLoss = sum(EVENT.TYPE == "LOSS"),
+    nGainPost = sum(EVENT.TYPE == "GAIN (post-tetraploidisation)"),
+    nGainPre = sum(EVENT.TYPE == "GAIN (pre-tetraploidisation)"),
+    nLossPost = sum(EVENT.TYPE == "LOSS (post-tetraploidisation)"),
+    nLossPre = sum(EVENT.TYPE == "LOSS (pre-tetraploidisation)"),
+    sumPresence = sum(presence)
+  ) %>%
+  
+  dplyr::select(-c(setdiff(colnames(dft1CnvLong), "tumor"))) %>%
+  distinct() %>%
+  
+  rowwise() %>%
+  
+  mutate(
+    
+    # ---- CASE 1: diploid ----
+    possibleCn = list(
+      if (ploidy == 2) {
+        possible_cn_absorbing(ploidy, nGain, nLoss)
+        
+      # ---- CASE 2: tetraploid with pre-events ----
+      } else if (ploidy == 4 & (nGainPre > 0 | nLossPre > 0)) {
+        
+        pre_cn <- possible_cn_absorbing(2, nGainPre, nLossPre)
+        pre_cn <- pre_cn * 2
+        
+        # apply post events to each possible pre state
+        unique(unlist(
+          lapply(pre_cn, function(cn) {
+            possible_cn_absorbing(
+              cn,
+              nGain + nGainPost,
+              nLoss + nLossPost
+            )
+          })
+        ))
+        
+      # ---- CASE 3: tetraploid without pre-events ----
+      } else if (ploidy == 4) {
+        
+        possible_cn_absorbing(
+          ploidy,
+          nGain + nGainPost,
+          nLoss + nLossPost
+        )
+        
+      } else {
+        NA_real_
+      }
+    ),
+    
+    minCn = min(possibleCn),
+    maxCn = max(possibleCn)
+    
+  ) %>%
+  ungroup() %>%
+  mutate(cnvAdjAnno = "multipleChanges")
+
+saveRDS(dft1CnvJoinMultipleChanges, 
+        paste0(resDir, 
+               fprefix, 
+               "_dft1CnvJoinMultipleChanges_withMultipleCnvOptions.rds"))
+
+multipleCns <- dft1CnvJoinMultipleChanges %>% 
+  filter(minCn != maxCn)
+
+dft1CnvJoinMultipleChangesFiltered <- dft1CnvJoinMultipleChanges %>%
+  filter(minCn == maxCn) %>%
+  mutate(copyNumberAdjusted = minCn) %>%
+  dplyr::select(-c(possibleCn, 
+                   maxCn, 
+                   minCn))
+```
+
+
+### 2.2.6 Rejoin tables
+- Adjust observed VAF using knowledge of purities. 
+- TRIPLE check no variants are missing because of filtering!
+- Add host columns for merging with germline variants later on. 
+- TODO: Fix X chromosome in male samples
+```{r}
+dft1SomCnvCorrected <- rbind(dft1CnvJoinNoChanges,
+                             dft1CnvJoinSingleChange,
+                             dft1CnvJoinMultipleChangesFiltered) %>%
+  dplyr::rename("purityTumor"="purity") %>%
+  mutate(obsVaf = Alt/Total,
+         nHostRef = 2, 
+         nHostAlt = 0, 
+         nTumorRef = NA, 
+         nTumorAlt = NA, 
+         nHostTotal = 2, 
+         copyNumberAdjusted = as.numeric(copyNumberAdjusted)) %>%
+  distinct() 
+
+saveRDS(dft1SomCnvCorrected, 
+        paste0(resDir, fprefix, "_dft1SomCnvCorrected.rds"))
+```
+
+# 3 Construct final table
+- Join adjusted CNV status with AlleleCounter results
+- Of note, NOT all samples have an associated RNA-seq file! See metadata script.
+- Merge with gtf file on informative positions (exons)
+- Compute tAlt from observed VAF.
+## 3.1 Use VAF, purity, and copy number to compute nTumorRef and nTumorAlt
+```{r}
+dft1SomGenotyped <- dft1SomCnvCorrected %>%
+  mutate(tAlt = computeTAlt(obsVaf, 
+                            purityTumor, 
+                            tTotal = copyNumberAdjusted, 
+                            hTotal = nHostRef+nHostAlt, 
+                            hAlt = nHostAlt), 
+         nTumorAlt = round(tAlt),
+         nTumorRef = copyNumberAdjusted-nTumorAlt
+         )
+
+saveRDS(dft1SomGenotyped, 
+        paste0(resDir, 
+               fprefix, 
+               "_dft1SomGenotyped.rds"))
+```
+
+
+
+
+## 3.2 Merge AlleleCounter results
+- Filter out rows for tumors where we don't have RNA seq data. 
+- 24 DFT1 tumors/XYZ tumors with matched RNA-seq data by tumor id.
+- Number of vars drops because not all vars in a tumor for which we have matched RNAseq.
+```{r}
+dft1SomGenotypedAlCo <- dft1SomGenotyped %>%
+  # filter(tumorLocationAlt %in% dft1SomAlCoCombined$tumorLocationAlt) %>%
+  left_join(dft1SomAlCoCombined %>%
+              dplyr::select(TOTAL,
+                            NREF, 
+                            NALT, 
+                            tumorLocationAlt,
+                            tumorIdRnaSeq)) %>%
+  distinct()
+
+saveRDS(dft1SomGenotypedAlCo, 
+        paste0(resDir, 
+               fprefix, 
+               "_dft1SomGenotypedAlCo.rds"))
+
+
+nrow(dft1SomGenotypedAlCo %>% 
+       filter(TOTAL > 0)) # 11290 variants
+
+rm(dft1SomCnvCorrected)
+gc()
+
+### Only one variant genotyped??? ### --> therefore others we don't have RNAseq data for. (Two tumors for 5 variants, 4 came from one tumor for which we don't have RNA seq, therefore only one variant remains.) All have 0 aligned reads anyways (52T2_2:385998837_T)
+checkMultipleCnsAlCo <- multipleCns %>%
+  # filter(tumorLocationAlt %in% dft1SomAlCoCombined$tumorLocationAlt) %>%
+  left_join(dft1SomAlCoCombined %>%
+              dplyr::select(TOTAL,
+                            NREF, 
+                            NALT, 
+                            tumorLocationAlt,
+                            tumorIdRnaSeq)) %>%
+  distinct() 
+```
+
+
+## 3.3 GTF annotations
+- noisyr has a function to extract all exons and positions from a gtf file.
+- alternatively annotate using 
+```{r}
+gtfFile <- "~/gitClones/01_Deconvolution/02_Deconvolution_DFT1/020_Data/RFS/Sarcophilus_harrisii.mSarHar1.11.115.gtf"
+
+gtf <- import(gtfFile)
+
+genes <- gtf[gtf$type == "gene"]
+
+exons <- gtf[gtf$type == "exon"]
+
+genes <- genes[genes$gene_biotype == "protein_coding"]
+
+
+variants <- GRanges(
+  seqnames = dft1SomGenotypedAlCo$chrom,
+  ranges = IRanges(start = dft1SomGenotypedAlCo$position, 
+                   end = dft1SomGenotypedAlCo$position)
+)
+
+# Which variants fall in an exon
+exonHits <- findOverlaps(variants, exons)
+
+# Map exon hits to gene IDs
+exonGeneIds <- exons$gene_id[subjectHits(exonHits)]
+exonGeneNames <- exons$gene_name[subjectHits(exonHits)]
+exonBiotypes <- exons$gene_biotype[subjectHits(exonHits)]
+
+hitsDf <- data.frame(
+  query = queryHits(exonHits),
+  gene_id = exonGeneIds,
+  gene_name = exonGeneNames,
+  biotype = exonBiotypes
+)
+
+collapseFun <- function(x) paste(unique(x), collapse = ";")
+
+collapsed <- aggregate(. ~ query, 
+                       data = hitsDf, 
+                       FUN = collapseFun)
+
+# Compare with assigned gene_id
+dft1SomGenotypedAlCoAnno <- dft1SomGenotypedAlCo
+
+dft1SomGenotypedAlCoAnno$exonGeneId <- NA
+dft1SomGenotypedAlCoAnno$exonGeneName <- NA
+dft1SomGenotypedAlCoAnno$exonBiotype <- NA
+
+dft1SomGenotypedAlCoAnno$exonGeneId[collapsed$query] <- collapsed$gene_id
+dft1SomGenotypedAlCoAnno$exonGeneName[collapsed$query] <- collapsed$gene_name
+dft1SomGenotypedAlCoAnno$exonBiotype[collapsed$query] <- collapsed$biotype
+
+length(unique(dft1SomGenotypedAlCoAnno %>%
+         filter(is.na(exonGeneId)==F) %>%
+         distinct() %>%
+         pull(tumorLocationAlt)))
+
+# [1] 2366 unique vars intersecting a gene
+
+length(unique(unique(dft1SomGenotypedAlCoAnno %>%
+         filter(is.na(exonGeneId)==F) %>%
+         distinct() %>%
+         pull(exonGeneId))))
+
+# [1] 1255 genes
+
+saveRDS(dft1SomGenotypedAlCoAnno, 
+        paste0(resDir, 
+               fprefix, 
+               "_dft1SomGenotypedAlCoAnno.rds"))
+
+write.xlsx(dft1SomGenotypedAlCoAnno %>%
+             filter(is.na(TOTAL)==F & is.na(exonGeneId) ==F), 
+        paste0(resDir, 
+               fprefix, 
+               "_dft1SomGenotypedAlCoAnnoCondensed.xlsx"))
+```

@@ -1,0 +1,267 @@
+---
+title: "08_deconvTable_readVariants"
+author: "IMEV2"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# 0 Environment
+## 0.1 Packages
+### 0.1.1 Library
+```{r echo=F, message=F, warning=FALSE}
+set.seed(123)
+library(tidyverse)
+library(openxlsx)
+library(dplyr)
+library(ggrepel)
+library(RColorBrewer)
+library(pheatmap)
+library(data.table)
+library(stringdist)
+```
+
+## 0.2 Paths
+```{r echo=F, message=FALSE, warning=FALSE}
+wDir <- paste0("~/gitClones/08_deconvTable/")
+fprefix <- "08_deconvTable_metadata"
+dataDir <- paste0(wDir, "/081_Data/")
+resDir <- paste0(wDir, "/083_Results/")
+dir.create(resDir)
+plotDir <- paste0(wDir, "/084_Plots/", fprefix, "/")
+dir.create(plotDir)
+```
+
+## 0.3 Custom functions
+
+# 1 Data
+## 1.1 VCF files
+### 1.1.1 DFT1 somatic variants
+- VCF file
+```{r}
+dft1Som <- read_table(paste0(dataDir, "Data_S1A_DFT1_somatic_variants.txt"), 
+                      col_types = cols(.default = "c"))
+
+dft1SomLong <- dft1Som %>%
+  pivot_longer(
+    cols = -c(CHROM, POS, REF, ALT),
+    names_to = "tumor",
+    values_to = "ratio"
+  ) %>%
+  mutate(chrom = as.character(CHROM), 
+         location = paste0(CHROM, ":", POS), 
+         position = as.numeric(POS)) %>%
+  filter(nchar(REF) == 1, nchar(ALT) == 1) 
+
+rm(dft1Som)
+gc()
+
+dft1Tumors <- dft1SomLong %>%
+  dplyr::select(tumor) %>%
+  distinct() %>%
+  mutate(VCF = "1", 
+         dftType = "dft1")
+```
+
+### 1.1.2 DFT2 somatic variants
+```{r}
+dft2Som <- read_table(paste0(dataDir, "Data_S1B_DFT2_somatic_variants.txt"),
+                      col_types = cols(.default = "c"))
+dft2SomLong <- dft2Som %>%
+  pivot_longer(
+    cols = -c(CHROM, POS, REF, ALT),
+    names_to = "tumor",
+    values_to = "ratio"
+  ) %>%
+  mutate(chrom = as.character(CHROM),
+         location = paste0(CHROM, ":", POS),
+         position = as.numeric(POS)) %>%
+  filter(nchar(REF) == 1, nchar(ALT) == 1)
+
+rm(dft2Som)
+gc()
+
+dft2Tumors <-  dft2SomLong %>%
+  dplyr::select(tumor) %>%
+  distinct() %>%
+  mutate(VCF = "1", 
+         dftType = "dft2")
+```
+
+### 1.1.3 Germline variants
+```{r}
+# germline <- read_table(paste0(dataDir, "Data_S1D_Tasmanian_devil_germline_variants.txt"),
+#                       col_types = cols(.default = "c"))
+# 
+# germlineLong <- head(germline) %>%
+#   as.data.frame() %>%
+#   pivot_longer(
+#     cols = -c(CHROM, POS, REF, ALT),
+#     names_to = "sample",
+#     values_to = "ratio"
+#   ) %>%
+#   mutate(chrom = as.character(CHROM),
+#          location = paste0(CHROM, ":", POS),
+#          position = as.numeric(POS)) %>%
+#   filter(nchar(REF) == 1, nchar(ALT) == 1)
+# 
+# rm(germline)
+# gc()
+```
+
+
+## 1.2 CNVs
+### 1.2.1 DFT1
+```{r}
+dft1Cnv <- read.xlsx("~/gitClones/07_suppDataPapers/suppScienceMax/science.abq6453_tables_s1_to_s8/science.abq6453_table_s6.xlsx", 
+                     sheet = "Table S6B", 
+                     startRow = 3)
+
+dft1CnvLong <- dft1Cnv %>%
+  pivot_longer(-c(1:12),
+              names_to = "tumor", 
+              values_to = "presence") %>%
+  mutate(presence = as.numeric(presence)) %>%
+  mutate(
+    START = as.numeric(START),
+    END = as.numeric(END),
+    CHROM = as.character(CHROM),
+    tumor = as.character(tumor)
+  )
+```
+
+
+## 1.3 Purities
+### 1.3.1 All samples
+```{r}
+purities <- read.xlsx("~/gitClones/07_suppDataPapers/suppScienceMax/science.abq6453_tables_s1_to_s8/science.abq6453_table_s2.xlsx", 
+                          sheet = 1, 
+                          startRow = 3)
+
+firstRow <- as.character(purities[1, ])
+
+# Create new column names
+newNames <- ifelse(
+  is.na(firstRow),
+  colnames(purities),
+  paste0(colnames(purities), "_", firstRow)
+)
+
+# Assign new names and remove the first row
+colnames(purities) <- newNames
+purities <- purities[-1, ]
+
+
+# All tumors in vcf files in supplementary metadata.
+# setdiff(dft1Tumors$tumor, purities$`TUMOUR.INFORMATION_TUMOUR ID`)
+# setdiff(dft2Tumors$tumor, purities$`TUMOUR.INFORMATION_TUMOUR ID`)
+```
+## 1.4 Allele counter data
+- Check for which tumors + hosts we have run alleleCounter (i.e., for which samples do we have RNAseq)?
+- Capital R = TR
+- a/b = BR
+- ALL RNA seq files were genotyped at every position, regardless of DFT1 and DFT2 status. 
+- Here checking how many of these RNAseq files were DFT1 versus DFT2. 
+### 1.4.1 DFT1
+- 115 RNA seq files
+```{r}
+dft1SomAlCo <- list.files(paste0(resDir, "/063_Results/06_deconvTable_alCo_dft1SomRefAltExport"), 
+                          recursive = T)
+
+# Read all files and combine
+dft1SomAlCoCombined <- rbindlist(lapply(dft1SomAlCo, function(f) {
+  # Extract tumor ID between "dft1SomRefAltExport_" and "_realigned"
+  tumorId <- sub(".*dft1SomRefAltExport_(.+)_realigned.*", "\\1", basename(f))
+  
+  # Read file
+  dt <- fread(paste0(resDir, "/063_Results/06_deconvTable_alCo_dft1SomRefAltExport/", f),
+              select = c("CHROM", "POS", "REF", "ALT", "TOTAL", "NREF", "NALT"))
+  
+  # Add tumor ID column
+  dt[, tumorId := tumorId]
+  
+  return(dt)
+})) 
+# %>%
+# mutate(tumorLocation = paste0())
+
+length(unique(dft1SomAlCoCombined$tumorId))
+```
+
+### 1.4.2 DFT2
+- 115 RNA seq files
+```{r}
+dft2SomAlCo <- list.files(paste0(resDir, "/063_Results/06_deconvTable_alCo_dft2SomRefAltExport"), 
+                          recursive = T)
+
+# Read all files and combine
+dft2SomAlCoCombined <- rbindlist(lapply(dft2SomAlCo, function(f) {
+  # Extract tumor ID between "dft2SomRefAltExport_" and "_realigned"
+  tumorId <- sub(".*dft2SomRefAltExport_(.+)_realigned.*", "\\1", basename(f))
+  
+  # Read file
+  dt <- fread(paste0(resDir, "/063_Results/06_deconvTable_alCo_dft2SomRefAltExport/", f),
+              select = c("CHROM", "POS", "REF", "ALT", "TOTAL", "NREF", "NALT"))
+  
+  # Add tumor ID column
+  dt[, tumorId := tumorId]
+  
+  return(dt)
+})) 
+# %>%
+# mutate(tumorLocation = paste0())
+
+length(unique(dft2SomAlCoCombined$tumorId))
+```
+
+### 1.4.3 All IRODS files
+- Projects 7511 and 5368
+- Fairly certain all 5368 files should have been used in Max's study??
+- At first filter only 35/121 tumors have a matched entry in Max's metadata.
+```{r}
+irodsMerged <- read.xlsx(paste0("~/gitClones/01_Deconvolution/02_Deconvolution_DFT1/020_Data/053_devilRna_irods/irodsMerged.xlsx")) %>%
+  dplyr::select(-c(collection, 
+                   data_object, 
+                   total_reads)) %>%
+  distinct() 
+
+write.xlsx(irodsMerged, 
+           paste0(resDir, fprefix,  "_irodsMergedDistinct.xlsx"))
+```
+
+# 2 Filter and join
+## 2.1 Add RNAseq column to metadata
+```{r}
+puritiesIrodsMerged <- purities %>%
+  mutate(
+    rnaSeq = ifelse(`TUMOUR.INFORMATION_TUMOUR ID` %in% irodsMerged$supplier,
+                    `TUMOUR.INFORMATION_TUMOUR ID`,
+                    "check"),
+    
+    rnaSeqPartial = sapply(`TUMOUR.INFORMATION_TUMOUR ID`, function(id) {
+      if (id %in% irodsMerged$supplier) {
+        return(id)
+      }
+      
+      # compute distances to all supplier names
+      dists <- stringdist(id, irodsMerged$supplier, method = "lv")
+      
+      # find matches with distance 1. Ex. is T1a RNAseq file versus T1 in Max's metadata.
+      matches <- irodsMerged$supplier[dists == 1]
+      
+      if (length(matches) > 0) {
+        return(matches[1])  # take first match (or adjust if needed)
+      } else {
+        "check"
+      }
+    })
+  )
+  
+
+write.xlsx(puritiesIrodsMerged, 
+           paste0(resDir, 
+                  fprefix, 
+                  "_purityIrodsMerged.xlsx"))
+```
+
+
+

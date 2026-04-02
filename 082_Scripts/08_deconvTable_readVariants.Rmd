@@ -1,0 +1,215 @@
+---
+title: "08_deconvTable_readVariants"
+author: "IMEV2"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# 0 Environment
+## 0.1 Packages
+### 0.1.1 Library
+```{r echo=F, message=F, warning=FALSE}
+set.seed(123)
+library(tidyverse)
+library(openxlsx)
+library(dplyr)
+library(ggrepel)
+library(RColorBrewer)
+library(pheatmap)
+library(txdbmaker)
+library(AnnotationDbi)
+library(GenomicRanges)
+```
+
+## 0.2 Paths
+```{r echo=F, message=FALSE, warning=FALSE}
+wDir <- paste0("~/gitClones/08_deconvTable/")
+fprefix <- "08_deconvTable"
+dataDir <- paste0(wDir, "/081_Data/")
+resDir <- paste0(wDir, "/083_Results/")
+dir.create(resDir)
+plotDir <- paste0(wDir, "/084_Plots/", fprefix, "/")
+dir.create(plotDir)
+scriptDir <-  paste0(wDir, "/082_Scripts/")
+dir.create(scriptDir)
+presDir <-  paste0(wDir, "/085_Presentations/")
+dir.create(presDir)
+
+
+hmDir <- paste0(plotDir, "/heatmap/")
+barDir <- paste0(plotDir, "/bar/")
+corrDir <- paste0(plotDir, "/corr/")
+upsetDir <- paste0(plotDir, "/upset/")
+dotDir <- paste0(plotDir, "/dot/")
+
+matDir <- paste0(resDir, "/matrix/")
+
+
+# dir.create(hmDir)
+# dir.create(corrDir)
+# dir.create(barDir)
+# dir.create(upsetDir)
+# dir.create(matDir)
+# dir.create(dotDir)
+```
+
+## 0.3 Custom functions
+
+# 1 Data
+## 1.1 Supplementary files
+### 1.1.1 DFT1 somatic variants
+- For alleleCounter, exclude indels and export version with column names (Kevin's version) and without (alleleCounter)
+```{r}
+dft1Som <- read_table(paste0(dataDir, "Data_S1A_DFT1_somatic_variants.txt"), 
+                      col_types = cols(.default = "c"))
+
+dft1SomLong <- dft1Som %>%
+  pivot_longer(
+    cols = -c(CHROM, POS, REF, ALT),
+    names_to = "tumor",
+    values_to = "ratio"
+  ) %>%
+  mutate(chrom = as.character(CHROM), 
+         location = paste0(CHROM, ":", POS), 
+         position = as.numeric(POS)) %>%
+  filter(nchar(REF) == 1, nchar(ALT) == 1)
+
+nas <- dft1SomLong %>%
+  filter(is.na(CHROM)==T)
+
+dft1SomExport <- dft1SomLong %>%
+  dplyr::select(1:4) %>%
+  distinct()
+
+write_tsv(dft1SomExport, 
+          paste0(resDir, fprefix, "_dft1SomRefAltExport_colnames.tsv"),
+          col_names = T, 
+          quote = "none")
+
+write_tsv(dft1SomExport, 
+          paste0(resDir, fprefix, "_dft1SomRefAltExport_withoutColnames.tsv"),
+          col_names = F, 
+          quote = "none")
+
+dft1SomExport <- dft1SomLong %>%
+  dplyr::select(1:2) %>%
+  distinct()
+
+write_tsv(dft1SomExport, 
+          paste0(resDir, fprefix, "_dft1SomExport_colnames.tsv"),
+          col_names = T, 
+          quote = "none")
+
+write_tsv(dft1SomExport, 
+          paste0(resDir, fprefix, "_dft1SomExport_withoutColnames.tsv"),
+          col_names = F, 
+          quote = "none")
+```
+
+### 1.1.2 DFT2 somatic variants
+```{r}
+dft2Som <- read_table(paste0(dataDir, "Data_S1B_DFT2_somatic_variants.txt"), 
+                      col_types = cols(.default = "c"))
+
+dft2SomLong <- dft2Som %>%
+  pivot_longer(
+    cols = -c(CHROM, POS, REF, ALT),
+    names_to = "tumor",
+    values_to = "ratio"
+  ) %>%
+  mutate(chrom = as.character(CHROM), 
+         location = paste0(CHROM, ":", POS), 
+         position = as.numeric(POS)) %>%
+  filter(nchar(REF) == 1, nchar(ALT) == 1) 
+
+nas <- dft2SomLong %>%
+  filter(is.na(CHROM)==T)
+
+dft2SomExport <- dft2SomLong %>%
+  dplyr::select(1:4) %>%
+  distinct()
+
+write_tsv(dft2SomExport, 
+          paste0(resDir, fprefix, "_dft2SomRefAltExport_colnames.tsv"),
+          col_names = T, 
+          quote = "none")
+
+write_tsv(dft2SomExport, 
+          paste0(resDir, fprefix, "_dft2SomRefAltExport_withoutColnames.tsv"),
+          col_names = F, 
+          quote = "none")
+
+dft2SomExport <- dft2SomLong %>%
+  dplyr::select(1:2) %>%
+  distinct()
+
+write_tsv(dft2SomExport, 
+          paste0(resDir, fprefix, "_dft2SomExport_colnames.tsv"),
+          col_names = T, 
+          quote = "none")
+
+write_tsv(dft2SomExport, 
+          paste0(resDir, fprefix, "_dft2SomExport_withoutColnames.tsv"),
+          col_names = F, 
+          quote = "none")
+```
+
+### 1.1.3 Germline variants
+```{r}
+germline <- read_table(paste0(dataDir, "Data_S1D_Tasmanian_devil_germline_variants.txt"), 
+                      col_types = cols(.default = "c"))
+
+germlineLong <- germline %>%
+  pivot_longer(
+    cols = -c(CHROM, POS, REF, ALT),
+    names_to = "tumor",
+    values_to = "ratio"
+  ) %>%
+  mutate(chrom = as.character(CHROM), 
+         location = paste0(CHROM, ":", POS), 
+         position = as.numeric(POS)) %>%
+  filter(nchar(REF) == 1, nchar(ALT) == 1)
+
+nas <- germlineLong %>%
+  filter(is.na(CHROM)==T)
+
+germlineExport <- germlineLong %>%
+  dplyr::select(1:4) %>%
+  distinct()
+
+write_tsv(germlineExport, 
+          paste0(resDir, fprefix, "_germlineRefAltExport_withoutColnames.tsv"),
+          col_names = F, 
+          quote = "none")
+
+write_tsv(germlineExport, 
+          paste0(resDir, fprefix, "_germlineRefAltExport_colnames.tsv"),
+          col_names = T, 
+          quote = "none")
+```
+
+## 1.2 GTF file
+```{r}
+exons <- rtracklayer::import(paste0("~/gitClones/01_Deconvolution/02_Deconvolution_DFT1/020_Data/RFS/Sarcophilus_harrisii.mSarHar1.11.115.gtf")) %>%
+  as.data.frame() %>%
+  filter(type == "exon")
+```
+
+## 1.4 Adrian's table (example)
+```{r}
+adrianDf <- read_csv(paste0("~/gitClones/01_Deconvolution/03_Deconvolution_CTVT/031_Data/ctvt_rnaseq_expression-2.csv"))
+head(adrianDf)
+
+length(unique((adrianDf$Tumour))) # [1] 42 - 9 from 
+length(unique(adrianDf$Symbol)) # [1] 17243
+length(unique(adrianDf$GeneID)) # [1] 17243
+```
+
+# 2 Filtering
+## 2.1 DFT1
+Per tumor-host pair, filter variants where alternative allele is exclusively in tumor or host!
+```{r}
+
+```
+
+

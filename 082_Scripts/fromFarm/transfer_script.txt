@@ -1,0 +1,4 @@
+# transfer script
+
+# to transfer from farm to my computer
+rsync --progress -h -r "nv4@farm22.internal.sanger.ac.uk://lustre/scratch125/casm/staging/team267_murchison/nv4/06_deconvTable/*" "/Users/nv4/gitClones/06_deconvTable/"
