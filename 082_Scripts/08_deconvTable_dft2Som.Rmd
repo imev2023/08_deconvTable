@@ -35,6 +35,19 @@ dir.create(plotDir)
 ```
 
 ## 0.3 Custom functions
+```{r}
+computeTAlt <- function(obsVaf, 
+                         purityTumor, 
+                         tTotal, 
+                         hTotal, 
+                         hAlt) {
+  
+    print("Solving for tAlt.")
+    denominator = purityTumor*tTotal + (1-purityTumor)*hTotal
+    tAlt = ((obsVaf*denominator)-(1-purityTumor)*hAlt)/purityTumor
+  return(tAlt)
+}
+```
 
 # 1 Data
 ## 1.1 VCF files

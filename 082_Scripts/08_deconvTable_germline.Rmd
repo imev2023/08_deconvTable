@@ -20,7 +20,9 @@ library(data.table)
 library(GenomicFeatures)
 library(rtracklayer)
 library(GenomicRanges)
-
+library(data.table)
+library(arrow)
+library(furrr)
 ```
 
 ## 0.2 Paths
@@ -32,72 +34,320 @@ resDir <- paste0(wDir, "/083_Results/")
 dir.create(resDir)
 plotDir <- paste0(wDir, "/084_Plots/", fprefix, "/")
 dir.create(plotDir)
+source("~/gitClones/08_deconvTable/082_Scripts/genotype_germline_variants.R")
 ```
 
 ## 0.3 Custom functions
+### 0.3.1 Compute tAlt
+```{r}
+computeTAlt <- function(obsVaf, 
+                         purityTumor, 
+                         tTotal, 
+                         hTotal, 
+                         hAlt) {
+  
+    print("Solving for tAlt.")
+    denominator = purityTumor*tTotal + (1-purityTumor)*hTotal
+    tAlt = ((obsVaf*denominator)-(1-purityTumor)*hAlt)/purityTumor
+  return(tAlt)
+}
+
+assign_nAlt_from_vaf <- function(vaf, total_cn) {
+  
+  if (is.na(total_cn) || is.na(vaf)) return(NA_integer_)
+  
+  if (total_cn == 0) return(0)
+  
+  if (total_cn == 1) {
+    return(ifelse(vaf < 0.5, 0, 1))
+  }
+  
+  if (total_cn == 2) {
+    if (vaf < 0.25) return(0)
+    else if (vaf < 0.75) return(1)
+    else return(2)
+  }
+  
+  if (total_cn == 3) {
+    if (vaf < 0.15) return(0)
+    else if (vaf < 0.5) return(1)
+    else if (vaf < 0.82) return(2)
+    else return(3)
+  }
+  
+  if (total_cn == 4) {
+    if (vaf < 0.12) return(0)
+    else if (vaf < 0.39) return(1)
+    else if (vaf < 0.64) return(2)
+    else if (vaf < 0.86) return(3)
+    else return(4)
+  }
+  
+  return(NA_integer_)  # fallback
+}
+```
+### 0.3.2 Compute hAlt
+```{r}
+computeHAlt <- function(obsVaf, 
+                         purityTumor, 
+                         tTotal, 
+                         tAlt,
+                         hTotal) {
+  
+  # Cases where hAlt = 0, solve for tAlt
+ 
+    print("Solving for hAlt.")
+    denominator = purityTumor*tTotal + (1-purityTumor)*hTotal
+    hAlt = (obsVaf*denominator)/(1-purityTumor)
+  return(hAlt)
+}
+
+computeHAlt(obsVaf = 0.5, 
+            purityTumor = 0.8, 
+            tTotal = 4, 
+            hTotal = 2, 
+            tAlt=0)
+
+
+
+```
+### 0.3.3 Geometric mean
+- Kevin's scripts
+  - To calculate size factors: 
+  - Compute the geom.mean of totals for each variant (optional: add pseudocount)
+  - Divide each variant's read total by the geometric mean for each variant
+  - Then take the median of these ratios for each sample
+  - (Optional) restrict to variants with presence in all tumors
+```{r}
+geomean <- function(x) {
+  if (all(x == 0)) {
+    NA_real_
+  } else {
+    exp(mean(log(x[x > 0])))
+  }
+}
+```
+
+### 0.3.4 Summarize germline variants
+```{r}
+library(dplyr)
+library(tidyr)
+
+library(data.table)
+
+summarise_variants_dt <- function(df) {
+  dt <- as.data.table(df)
+  
+  # ensure uniqueness per tumor per location
+  dt <- unique(dt[, .(locationAlt, sampleTumor, statusUpdate)])
+  
+  # count per location + status
+  counts <- dt[, .N, by = .(locationAlt, statusUpdate)]
+  
+  # total tumors per location
+  totals <- dt[, .(total_tumors = uniqueN(sampleTumor)), by = locationAlt]
+  
+  # merge counts with totals
+  counts <- counts[totals, on = "locationAlt"]
+  
+  # compute percentage
+  counts[, pct := N / total_tumors]
+  
+  # reshape wide (one column per statusUpdate)
+  wide <- dcast(
+    counts,
+    locationAlt + total_tumors ~ statusUpdate,
+    value.var = "pct",
+    fill = 0
+  )
+  
+  # compute majority
+  status_cols <- setdiff(names(wide), c("locationAlt", "total_tumors"))
+  
+  wide[, majority := {
+    vals <- unlist(.SD)
+    max_val <- max(vals)
+    winners <- names(vals)[vals == max_val]
+    
+    if (length(winners) > 1) "flag" else winners
+  }, by = locationAlt, .SDcols = status_cols]
+  
+  return(wide)
+}
+```
+
 
 # 1 Data
 ## 1.1 VCF files
 - Read in germline vcf file
 - Pivot longer so that each variant and each sample is a single row with the ALT/TOTAL ratio.
 ```{r}
-germline <- read_table(paste0(dataDir, "Data_S1D_Tasmanian_devil_germline_variants.txt"),
-                      col_types = cols(.default = "c"))
-
-sampleInfo <- tibble(sample = colnames(germline)[-(1:4)]) %>%
-  mutate(
-    sampleType = str_extract(sample, "T|H"),
-    tcgId = str_extract(sample, "^[^TH]+")
-  )
-
-
-germlineLong <- germline %>%
-  filter(nchar(REF) == 1, 
-         nchar(ALT) == 1) %>%
-  pivot_longer(
-    cols = -c(CHROM, POS, REF, ALT),
-    names_to = "sample",
-    values_to = "ratio"
-  ) %>%
-  left_join(sampleInfo, by = "sample") %>%
-  transmute(
-    CHROM,
-    POS,
-    REF,
-    ALT,
-    tcgId,
-    sampleType,
-    ratio,
-    sample
-  )
+# germline <- read_table(paste0(dataDir, "Data_S1D_Tasmanian_devil_germline_variants.txt"),
+#                       col_types = cols(.default = "c"))
+# 
+# sampleInfo <- tibble(sample = colnames(germline)[-(1:4)]) %>%
+#   mutate(
+#     sampleType = str_extract(sample, "T|H"),
+#     tcgId = str_extract(sample, "^[^TH]+")
+#   )
+# 
+# 
+# germlineLong <- germline %>%
+#   filter(nchar(REF) == 1, 
+#          nchar(ALT) == 1) %>%
+#   pivot_longer(
+#     cols = -c(CHROM, POS, REF, ALT),
+#     names_to = "sample",
+#     values_to = "ratio"
+#   ) %>%
+#   left_join(sampleInfo, by = "sample") %>%
+#   transmute(
+#     CHROM,
+#     POS,
+#     REF,
+#     ALT,
+#     tcgId,
+#     sampleType,
+#     ratio,
+#     sample
+#   )
+# 
+# saveRDS(germlineLong, 
+#         paste0(resDir, 
+#                fprefix, 
+#                "_germlineLong.rds"))
 ```
 
 ## 1.2 Pair tumor/host samples
 - Using shared ID's pivot wider so that the ratio for matched tumor/host samples is side by side.
-- Filter on variants where alt allele is present in only the host or the tumor sample! 
+- Filter on variants where alt allele is present in only the host or the tumor sample within a pair! --> so that we have info. on tAlt or hAlt at that position.
+  - 75/121 tumors in the VCF file have an informative variant, where one of the alt alleles is 0.
+  - Filter for tumor id's for which we have matched RNAseq data. 
 ```{r}
-tumor <- germlineLong %>%
-  filter(sampleType == "T") %>%
-  rename(
-    ratio_T = ratio,
-    sample_T = sample
-  ) %>%
-  select(-sampleType)
+# tumor <- germlineLong %>%
+#   filter(sampleType == "T") %>%
+#   dplyr::rename(
+#     vafTumor = ratio,
+#     sampleTumor = sample
+#   ) %>%
+#   dplyr::select(-sampleType)
+# 
+# normal <- germlineLong %>%
+#   filter(sampleType == "H") %>%
+#   dplyr::rename(
+#     vafHost = ratio,
+#     sampleHost = sample
+#   ) %>%
+#   dplyr::select(-sampleType)
+# 
+# paired <- tumor %>%
+#   inner_join(normal,
+#              by = c("CHROM", 
+#                     "POS", "REF", "ALT", "tcgId"))
+# 
+# saveRDS(paired, 
+#         paste0(resDir, 
+#                fprefix, 
+#                "_germlinePaired.rds"))
+# 
+# germlinePairedFiltered <- paired %>%
+#   filter(
+#     str_starts(vafHost, "0/") != str_starts(vafTumor, "0/")
+# germlinePairedFiltered$tumorLocationAlt <- paste0(germlinePairedFiltered$sampleTumor, 
+#                                                    "_", germlinePairedFiltered$CHROM, 
+#                                                   ":", germlinePairedFiltered$POS, 
+#                                                   "_", germlinePairedFiltered$ALT)
+#   )
+# 
+# saveRDS(germlinePairedFiltered,
+#         paste0(resDir,
+#                fprefix,
+#                "_germlinePairedFiltered.rds"))
+# rm(germlineLong, 
+#    germline, 
+#    paired, 
+#    normal, 
+#    tumor)
+# 
+# gc()
+# germlinePairedFiltered <- readRDS(paste0(resDir,
+#                fprefix,
+#                "_germlinePairedFiltered.rds"))
+# germlinePairedTest <- germlinePairedFiltered[1:1000,] %>%
+#   mutate(
+#     tumorAlt = as.integer(sub("/.*", "", vafTumor)),
+#     tumorTotal = as.integer(sub(".*/", "", vafTumor)),
+#     hostAlt = as.integer(sub("/.*", "", vafHost)), 
+#     hostTotal = as.integer(sub(".*/", "", vafHost))
+#   ) %>%
+#   mutate(vafTumor = tumorAlt/tumorTotal, 
+#          vafHost = hostAlt/hostTotal) %>%
+#   mutate(hAlt = ifelse(tumorAlt == 0, 
+#                        vafHost*2, 
+#                        ifelse(hostAlt == 0, 
+#                               0, 
+#                               NA)), 
+#          nHostAlt = round(hAlt), 
+#          nHostRef = 2-nHostAlt)
+# 
+# %>%
+#   mutate(tumorLocationAlt = paste(sampleTumor, "_", CHROM, ":", POS, "_", ALT)
+# germlinePaired <- readRDS(paste0(resDir,
+#                fprefix,
+#                "_germlinePaired.rds")) %>%
+#   mutate(
+#     tumorAlt = as.integer(sub("/.*", "", vafTumor)),
+#     tumorTotal = as.integer(sub(".*/", "", vafTumor)),
+#     hostAlt = as.integer(sub("/.*", "", vafHost)),
+#     hostTotal = as.integer(sub(".*/", "", vafHost))
+#   ) %>%
+#   mutate(obsVafTumor = tumorAlt/tumorTotal,
+#          obsVafHost = hostAlt/hostTotal)%>%
+#  mutate(tumorLocationAlt = paste0(sampleTumor, "_", CHROM, ":", POS, "_", ALT))
+# 
+# saveRDS(germlinePaired,
+#         paste0(resDir,
+#                fprefix,
+#                "_germlinePaired.rds") )
+# set.seed(123)
+# test <- germlinePaired[sample(nrow(germlinePaired), 5000),]
+# saveRDS(test, 
+#         paste0(resDir, 
+#                fprefix, 
+#                "_germlinePairedTest.rds"))
+# 
 
-normal <- germlineLong %>%
-  filter(sampleType == "H") %>%
-  rename(
-    ratio_H = ratio,
-    sample_H = sample
-  ) %>%
-  select(-sampleType)
+# test <- readRDS(paste0(resDir,
+#                fprefix,
+#                "_germlinePairedTest.rds")) %>%
+#   mutate(
+#     tumorAlt = as.integer(sub("/.*", "", vafTumor)),
+#     tumorTotal = as.integer(sub(".*/", "", vafTumor)),
+#     hostAlt = as.integer(sub("/.*", "", vafHost)),
+#     hostTotal = as.integer(sub(".*/", "", vafHost))
+#   ) %>%
+#   mutate(obsVafTumor = tumorAlt/tumorTotal,
+#          obsVafHost = hostAlt/hostTotal)%>%
+#  mutate(tumorLocationAlt = paste0(sampleTumor, "_", CHROM, ":", POS, "_", ALT))
 
-paired <- tumor %>%
-  inner_join(normal,
-             by = c("CHROM", "POS", "REF", "ALT", "tcgId"))
+# library(arrow)
+# 
+# write_parquet(germlinePaired, paste0(resDir,
+#                fprefix,
+#                "_germlinePaired.parquet"))
 
+# germlinePaired <- open_dataset(paste0(resDir, 
+#                                       fprefix,
+#                                       "_germlinePaired.parquet")) 
 ```
 
+## 1.3 Subset germline vcfs by host, tumor, or shared vaf's.
+- Germline (host+tumour) variants are defined as those with VAF >0.25 in any host.
+- That could mean it has 0 VAF in a given tumor sample, but this was not observed in all samples and is therefore not somatic. 
+- How to account for this when calling "true" informative variants?
+```{r}
+# germlinePairedFiltered <- germlinePaired 
+```
 
 ## 1.2 CNVs
 - Any germline variants falling within a CNV event were filtered out, so no need to adjust ploidy! 
@@ -123,7 +373,7 @@ paired <- tumor %>%
 ```
 
 
-## 1.3 Purities
+## 1.3 Purities and ploidy
 ```{r}
 germlinePurities <- read.xlsx("~/gitClones/07_suppDataPapers/suppScienceMax/science.abq6453_tables_s1_to_s8/science.abq6453_table_s2.xlsx", 
                           sheet = 1, 
@@ -141,6 +391,39 @@ newNames <- ifelse(
 # Assign new names and remove the first row
 colnames(germlinePurities) <- newNames
 germlinePurities <- germlinePurities[-1, ]
+
+germlinePuritiesPloidy <- germlinePurities %>%
+  mutate(ploidy = ifelse(X15_PLOIDY == "diploid",
+                 2, 
+                 ifelse(X15_PLOIDY == "tetraploid", 
+                        4, 
+                        "toCheck") 
+                 )) %>%
+  filter(ploidy != "toCheck") %>%
+  dplyr::rename("sampleTumor"="TUMOUR.INFORMATION_TUMOUR ID", 
+                     "purity"="X14_PURITY (VAF-based)", 
+                "dftType"="X9_LINEAGE") %>%
+              mutate(purity = as.numeric(purity), 
+                     ploidy = as.numeric(ploidy), 
+                     sex=ifelse(HOST.SEX == "♂", 
+                                "male", 
+                                ifelse(HOST.SEX == "♀", 
+                                       "female", 
+                                       "toCheck"))) %>%
+              dplyr::select(sampleTumor, 
+                            ploidy, 
+                            purity, 
+                            sex, 
+                            dftType
+                            ) 
+  
+table(germlinePuritiesPloidy$sex, germlinePuritiesPloidy$dftType)
+
+males <- germlinePuritiesPloidy %>%
+  filter(sex == "male") 
+
+dft2 <- germlinePuritiesPloidy %>%
+  filter(dftType == "DFT2") 
 ```
 
 ## 1.4 Allele counter data
@@ -152,50 +435,694 @@ germlinePurities <- germlinePurities[-1, ]
 ### 1.4.1 Metadata
 - Mapping AlCo results to VCF file names
 - FOR now, filter where mapping = 1. There are sample names that I am certain match the name in Max's supplementary table. 
+  - 46/75 tumors in Max's VCF file WITH an informative germline variant have a matched RNAseq file!
 - Go back and check once workflow is done
 ```{r}
 metadata <- read.xlsx(paste0(resDir,
                           "08_deconvTable_metadata_purityIrodsMergedManualEdit.xlsx")) %>%
   filter(mapping==1)  %>%
-              dplyr::rename("tumorId"="TUMOUR.INFORMATION_TUMOUR.ID", 
+              dplyr::rename("tumorId"="TUMOUR.INFORMATION_TUMOUR.ID",
                      "tumorIdRnaSeq"="rnaSeqManual")
+
+# length(intersect(germlinePaired$sampleTumor, metadata$tumorId))
+## 46  
+
+dft2 <- metadata %>% 
+  filter(X9_LINEAGE == "DFT2") %>%
+  pull(tumorId)
 ```
 
-### 1.4.2 DFT2
-#### 1.4.2.1 Read in AlCo results
+### 1.4.2 Read in AlCo results
+- Here, tumorId = the name of the RNAseq file. Need to join this with the metadata table and switch out for the VCF tumor name (Max's supp data.)
+- We have AlCo data from 115 tumors, calling this the tumorRnaSeqId. 
+  - This can be left joined with the paired tumorId from the metadata.
+
 ```{r}
-germlineAlCo <- list.files(paste0(resDir, "/063_Results/06_deconvTable_alCo_germlineRefAltExport"), 
-                          recursive = T)
+# germlineAlCo <- list.files(paste0(resDir, "/063_Results/06_deconvTable_alCo_germlineRefAltExport"),
+#                           recursive = T)
+# 
+# # Read all files and combine
+# germlineAlCoDf <- rbindlist(lapply(germlineAlCo, function(f) {
+#   # Extract tumor ID between "germlineRefAltExport_" and "_realigned"
+#   tumorIdRnaSeq <- sub(".*germlineRefAltExport_(.+)_realigned.*", "\\1", basename(f))
+# 
+#   # Read file
+#   dt <- fread(paste0(resDir, "/063_Results/06_deconvTable_alCo_germlineRefAltExport/", f),
+#               select = c("CHROM", "POS", "REF", "ALT", "TOTAL", "NREF", "NALT"))
+# 
+#   # Add tumor ID column
+#   dt[, tumorIdRnaSeq := tumorIdRnaSeq]
+# 
+#   return(dt)
+# }))
+# 
+# length(unique(germlineAlCoDf$tumorIdRnaSeq)) # 115 RNAseq samples were genotyped.
+# 
+# length(intersect(germlineAlCoDf$tumorIdRnaSeq, metadata$tumorIdRnaSeq)) # 53 samples for which we have a paired RNAseq-DNAseq file.
+# 
+chunk_size <- 5e4  # adjust to your RAM
+# 
+# ## Left join metadata
+# germlineAlCoDf <- germlineAlCoDf %>%
+#   mutate(rowId = row_number(),
+#          chunk_id = (rowId - 1) %/% chunk_size) 
+# 
+# write_dataset(
+#   germlineAlCoDf,
+#   path = paste0(resDir, "germlineAlCoDf/"),
+#   format = "parquet",
+#   partitioning = "chunk_id"
+# )
 
-# Read all files and combine
-germlineAlCoDf <- rbindlist(lapply(germlineAlCo, function(f) {
-  # Extract tumor ID between "germlineRefAltExport_" and "_realigned"
-  tumorId <- sub(".*germlineRefAltExport_(.+)_realigned.*", "\\1", basename(f))
-  
-  # Read file
-  dt <- fread(paste0(resDir, "/063_Results/06_deconvTable_alCo_germlineRefAltExport/", f),
-              select = c("CHROM", "POS", "REF", "ALT", "TOTAL", "NREF", "NALT"))
-  
-  # Add tumor ID column
-  dt[, tumorId := tumorId]
-  
-  return(dt)
-})) 
-
-length(unique(germlineAlCoDf$tumorId))
+# Perform filtering and mutate on arrow, less memory intensive.
+# Rows left after filter informative samples = 58966002
+# germlineAlCoDfFiltered <- open_dataset(paste0(resDir, "germlineAlCoDf/")) %>%
+#   filter(tumorIdRnaSeq %in% metadata$tumorIdRnaSeq) %>%
+#   left_join(metadata) %>%
+#   # Tumor ID = sample ID from germline vcf.
+#   mutate(tumorLocationAlt = paste0(tumorId, "_", CHROM, ":", POS, "_", ALT), 
+#          sampleTumor = tumorId) %>%
+#   dplyr::select(-c(tumorId))
+# 
+# write_dataset(
+#   germlineAlCoDfFiltered,
+#   path = paste0(resDir, "germlineAlCoDfFiltered/"),
+#   format = "parquet", 
+#   partitioning = "sampleTumor"
+#   
+# )
 ```
-#### 1.4.2.2 Adjust tumorId of RNAseq data to match Max's metadata
-- Make tumorId the metadata id.
-- Save RNAseq data name.
-- Adjust tumorLocationAlt
+
+### 1.4.3 Adjust tumorId of RNAseq data to match Max's metadata
+- Filter to keep only samples for which we have RNAseq data.
+  - Filter tumorId in AlCo for those in metadata$tumorIdRnaSeq
+- Left join with metadata table, to get the matched tumorId
+- Create new column, tumorId_CHROM_POS_ALT
+- Filter for informative AlCo positions in germlinePaired, otherwise there are too many values in the table (slow to work with).
+  - 53 / 115 tumor samples have matched RNA (need to check this.)
+  - 46/75 samples have an informative variant in the germline vcf file AND a matched RNAseq position. 
+  - /46 have at least one variant with TOTAL AlCo > 0. 
 ```{r}
-germlineAlCoCombined <- germlineAlCoDf %>%
-  filter(tumorId %in% metadata$tumorIdRnaSeq) %>%
-  left_join(metadata %>%
-              dplyr::select(tumorId,
-                            tumorIdRnaSeq)) %>%
-  mutate(tumorLocation = paste0(tumorId, "_", CHROM, ":", POS), 
-         tumorLocationAlt = paste0(tumorId, "_", CHROM, ":", POS, "_", ALT))
-
-length(unique(germlineAlCoCombined$tumorId))
+# setDT(germlineAlCoDf)
+# 
+# # fast filtering
+# germlineAlCoCombined <- germlineAlCoDf[tumorIdRnaSeq %in% metadata$tumorIdRnaSeq] %>%
+#   left_join(metadata %>%
+#               dplyr::select(tumorId, tumorIdRnaSeq))
+# 
+# germlineAlCoCombined[, c("tumorLocation", "tumorLocationAlt") := .(
+#   paste0(tumorId, "_", CHROM, ":", POS),
+#   paste0(tumorId, "_", CHROM, ":", POS, "_", ALT)
+# )]
+# 
+# saveRDS(germlineAlCoCombined,
+#         paste0(resDir,
+#                fprefix,
+#                "_germlineAlCoCombined.rds"))
+# 
+# germlineAlCoCombined <- readRDS(paste0(resDir,
+#                fprefix,
+#                "_germlineAlCoCombined.rds"))
+# 
+# 
+# germlineAlCoCombinedFiltered <- germlineAlCoCombined[tumorLocationAlt %in% germlinePaired$tumorLocationAlt]
+# 
+# 
+# saveRDS(germlineAlCoCombinedFiltered,
+#         paste0(resDir,
+#                fprefix,
+#                "_germlineAlCoCombinedFiltered.rds"))
+# 
+# rm(germlineAlCoCombined,
+#    germlineAlCoDf,
+#    germlinePairedFiltered)
+# 
+# gc()
+# 
+# germlineAlCoCombinedFiltered <- readRDS(paste0(resDir, 
+#                fprefix, 
+#                "_germlineAlCoCombinedFiltered.rds")) 
 ```
+
+# 3 Construct final table
+## 3.1 Compute genotypes
+- Adjust total CN for X and Y chromosomes in male samples
+- In a pure sample, vafH = 0 + (1)*Halt/(0 + 1*Htotal). Therefore, Halt = vafH*Htotal. 
+- How do deal with ploidy for X and Y in male samples in 
+### 3.1.1 Test dataset
+- 5000 random rows
+- Compare basic implementation to Kevin's formula, which should only affect flagged cases.
+```{r}
+# testGenotyped <- test %>%
+#   left_join(germlinePuritiesPloidy) %>%
+#   filter(sampleTumor %in% metadata$tumorId) %>%
+#   filter(!sampleTumor %in% c("212T",
+#                             "818T1")) %>%
+#   mutate(nHostTotal = ifelse(sampleTumor %in% males$sampleTumor & CHROM %in% c("X", "Y"), 
+#                              1, 
+#                              2), 
+#          nTumorTotal = ifelse(sampleTumor %in% males$sampleTumor & CHROM %in% c("X", "Y"), 
+#                              ploidy/2,  # tetraploid tumors have XXYY.
+#                              ploidy))  %>%
+#   # Using a pure host sample (i.e., p = 0)
+#   mutate(hAlt = obsVafHost * nHostTotal,
+#          nHostAlt = round(hAlt),
+#          nHostAltFlagged = pmin(nHostAlt, nHostTotal),
+#          flag = nHostAlt > nHostTotal,
+#          nHostRef = nHostTotal - nHostAltFlagged) %>%
+#   
+#   # Estimate tAlt
+#   mutate(tAlt = computeTAlt(obsVaf = obsVafTumor,
+#                             purityTumor = purity,
+#                             tTotal = nTumorTotal,
+#                             hTotal = nHostTotal,
+#                             hAlt = nHostAltFlagged)) %>%
+#   ########
+#   # Round for nTumorAlt
+#   mutate(nTumorAlt = round(tAlt),
+#          flag = nTumorAlt > nTumorTotal, 
+#          nTumorAltFlagged = pmin(nTumorAlt, nTumorTotal)) %>%
+#   # No conditions where using estimate of NAlt changes nTumorAlt.
+#   # filter(nTumorAltFromHAlt!=nTumorAltFromNHAlt) %>%
+#   mutate(nTumorRef = nTumorTotal-nTumorAltFlagged,
+#          flag = nTumorAlt > nTumorTotal) 
+#   
+# 
+# ### Now test with Kevin's function. Run genotyper in parallel. 
+# plan(multisession, workers = availableCores() - 1)
+# 
+# # Run genotyper in parallel — both outputs extracted in a single pass per row.
+# results <- furrr::future_pmap(
+#   .l = list(
+#     hostPloidy = testGenotyped$nHostTotal,
+#     tumorPloidy = testGenotyped$nTumorTotal,
+#     hostObsAlt = testGenotyped$hostAlt,
+#     hostObsTotal = testGenotyped$hostTotal,
+#     tumorObsAlt = testGenotyped$tumorAlt,
+#     tumorObsTotal = testGenotyped$tumorTotal,
+#     purity  = testGenotyped$purity
+#   ),
+#   .f = function(hostPloidy,
+#                 tumorPloidy,
+#                 hostObsAlt,
+#                 hostObsTotal,
+#                 tumorObsAlt,
+#                 tumorObsTotal,
+#                 purity) {
+#     # g <- genotyper(hp, tp, ha, ht, ta, tt, p)$E
+#     g <- genotyper(host_ploidy = hostPloidy,
+#                    tumour_ploidy = tumorPloidy,
+#                    host_observed_alt_reads = hostObsAlt,
+#                    host_observed_total_reads = hostObsTotal,
+#                    tumour_observed_alt_reads = tumorObsAlt ,
+#                    tumour_observed_total_reads = tumorObsTotal,
+#                    tumour_purity = purity)
+#     list(g_host = g$E$g_host, 
+#          g_tumour = g$E$g_tumour, 
+#          g=g)
+#   },
+#   .options = furrr_options(seed = NULL)  # no RNG used, avoids overhead
+# )
+# 
+# testGenotyped$nHostAltGenotyper  <- vapply(results, `[[`, numeric(1), "g_host")
+# testGenotyped$nTumorAltGenotyper <- vapply(results, `[[`, numeric(1), "g_tumour")
+# 
+# # Reset to sequential when done
+# plan(sequential)
+# 
+# saveRDS(testGenotyped, 
+#         paste0(resDir, fprefix, "_testGenotyped.rds"))
+```
+
+### 3.1.2 Full dataset
+- If host sample is a male, total CN at sex chromosomes == 1
+- If tumor sample is DFT2, total CN at sex chromosomes == 1 or 2 depending on original ploidy.
+```{r}
+germlinePaired <- read_parquet(paste0(resDir,
+                                      "08_deconvTable_germline_germlinePaired.parquet"))
+
+
+germlinePairedGenotyped <- arrow_table(germlinePaired) %>%
+  left_join(germlinePuritiesPloidy) %>%
+  filter(sampleTumor %in% metadata$tumorId) %>%
+  filter(!sampleTumor %in% c("212T",
+                            "818T1")) %>%
+  mutate(nHostTotal = ifelse(sampleTumor %in% males$sampleTumor & CHROM %in% c("X", "Y"),
+                             1,
+                             2),
+         nTumorTotal = ifelse(sampleTumor %in% dft2$sampleTumor & CHROM %in% c("X", "Y"),
+                             ploidy/2,  # tetraploid tumors have XXYY.
+                             ploidy)) %>%
+  collect()
+
+germlinePairedGenotyped$rowId <- 1:nrow(germlinePairedGenotyped)
+
+chunk_size <- 5e4  # adjust to your RAM
+
+germlinePairedGenotyped <- germlinePairedGenotyped %>%
+  mutate(chunk_id = (rowId - 1) %/% chunk_size)
+
+gc()
+
+write_dataset(
+  germlinePairedGenotyped,
+  path = paste0(resDir, "germlinePartitioned/"),
+  format = "parquet",
+  partitioning = "chunk_id"
+)
+```
+
+### 3.1.3 Run genotyper in chunks
+```{r}
+ds <- open_dataset(paste0(resDir, "germlinePartitioned/"))
+
+plan(multisession, workers = availableCores() - 1)
+
+chunk_ids <- ds %>%
+  distinct(chunk_id) %>%
+  collect() %>%
+  pull()
+
+for (cid in chunk_ids) {
+
+  cat("Processing chunk", cid, "\n")
+
+  chunk <- ds %>%
+    filter(chunk_id == cid)  %>%
+    collect()
+
+  if (nrow(chunk) == 0) next
+
+  results <- future_pmap(
+    .l = list(
+      chunk$nHostTotal,
+      chunk$nTumorTotal,
+      chunk$hostAlt,
+      chunk$hostTotal,
+      chunk$tumorAlt,
+      chunk$tumorTotal,
+      chunk$purity
+    ),
+    .f = function(hp, tp, ha, ht, ta, tt, p) {
+
+      g <- genotyper(hp, tp, ha, ht, ta, tt, p)
+
+      c(g_host = g$E$g_host,
+        g_tumour = g$E$g_tumour, 
+        map_g_host = g$map[1, "g_host"],
+        map_g_tumour = g$map[1, "g_tumour"])
+    }
+  )
+
+  res <- do.call(rbind, results)
+
+  chunk$nHostAltGtyr <- res[,1]
+  chunk$nHostAltGtyrRounded  <- round(res[,1])
+  chunk$nHostRefGtyrRounded <- chunk$nHostTotal - chunk$nHostAltGtyrRounded
+
+  chunk$nTumorAltGtyr <- res[,2]
+  chunk$nTumorAltGtyrRounded  <- round(res[,2])
+  chunk$nTumorRefGtyrRounded <- chunk$nTumorTotal - chunk$nTumorAltGtyrRounded
+  
+  chunk$nHostAltGtyrMapped <- res[,3]
+  chunk$nHostRefGtyrMapped <- chunk$nHostTotal - chunk$nHostAltGtyrMapped
+
+  chunk$nTumorAltGtyrMapped <- res[,4]
+  chunk$nTumorRefGtyrMapped <- chunk$nTumorTotal - chunk$nTumorAltGtyrMapped
+
+  write_parquet(
+    chunk,
+    paste0(resDir, "germlineGenotyper/genotyped_chunk_", cid, ".parquet")
+  )
+
+  rm(chunk, results, res)
+  gc()
+}
+
+plan(sequential)
+```
+### 3.1.4 Plot genotyper() results
+- Annotate germline status as hom alt, hom ref, or het
+- Check what the majority status is at each position (e.g., are >50% of tumors hom alt?)
+  - Add % column
+  - Add majority assignment
+- Create 10KB bins along entire genome
+- Per tumor, plo
+```{r}
+# Diploid tumors
+germlinePairedGenotypedStatus <- open_dataset(paste0(resDir, "germlineGenotyper/")) %>%
+  mutate(status = ifelse(nTumorRefGtyrMapped == ploidy & nTumorAltGtyrMapped == 0, 
+                "homRef", 
+                ifelse(nTumorAltGtyrMapped == ploidy & nTumorRefGtyrMapped == 0, 
+                       "homAlt", 
+                       ifelse(nTumorRefGtyrMapped > 0 & nTumorRefGtyrMapped <  ploidy & nTumorAltGtyrMapped > 0 & nTumorAltGtyrMapped < ploidy, 
+                              "het", 
+                              "toCheck"))), 
+         statusUpdate = ifelse(status == "toCheck" & nTumorRefGtyrMapped > 0 & nTumorAltGtyrMapped == 0, 
+                "Ref", 
+                ifelse(status == "toCheck" & nTumorAltGtyrMapped > 0 & nTumorRefGtyrMapped == 0, 
+                       "Alt", 
+                       status))) %>%
+  mutate(locationAlt = paste0(CHROM, ":", POS, "_", REF, ALT)) 
+
+
+# table(germlinePairedGenotypedStatus$sampleTumor, 
+#       germlinePairedGenotypedStatus$statusUpdate)
+# germlinePairedGenotypedStatusNormal <- germlinePairedGenotypedStatus %>%
+#   filter(status != "toCheck")
+# 
+# germlinePairedGenotypedStatusCheck <- germlinePairedGenotypedStatus %>%
+#   filter(status == "toCheck") %>%
+#   mutate(status = ifelse(nTumorRefGtyrMapped > 0 & nTumorAltGtyrMapped == 0,
+#                 "Ref",
+#                 ifelse(nTumorAltGtyrMapped > 0 & nTumorRefGtyrMapped == 0,
+#                        "Alt",
+#                        "toCheck"))) %>%
+#   collect()
+# 
+# table(germlinePairedGenotypedStatusCheck$status)
+# table(germlinePairedGenotypedStatusCheck$status)
+# > table(germlinePairedGenotypedStatusCheck$CHROM, germlinePairedGenotypedStatusCheck$sex)
+#       male
+#   X 227124
+#   Y     26
+# table(germlinePairedGenotypedStatusCheck$statusUpdate)
+# 
+#     Ref toCheck 
+#  158950   68200 
+
+
+germlinePairedGenotypedStatusDft2 <- germlinePairedGenotypedStatus  %>%
+  filter(sampleTumor %in% dft2$sampleTumor) %>%
+  distinct(locationAlt, sampleTumor, statusUpdate) %>%
+  group_by(locationAlt, statusUpdate) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(locationAlt) %>%
+  mutate(total_tumors = sum(n),
+         pct = n / total_tumors) %>% 
+  collect()
+
+
+dt <- as.data.table(germlinePairedGenotypedStatusDft2)
+
+all_status <- c("homRef", "homAlt", "het", "Ref", "Alt", "toCheck")
+
+resultDft2 <- dt[, {
+  # initialize all statuses to 0
+  pct_vec <- setNames(rep(0, length(all_status)), all_status)
+  
+  # fill observed values
+  pct_vec[statusUpdate] <- pct
+  
+  # majority logic
+  max_val <- max(pct_vec)
+  winners <- names(pct_vec)[pct_vec == max_val]
+  majority <- if (length(winners) > 1) "flag" else winners
+  
+  c(
+    list(total_tumors = unique(total_tumors)),
+    as.list(pct_vec),
+    list(majority = majority)
+  )
+}, by = locationAlt]
+
+
+checkFlagsDft2 <- resultDft2 %>%
+  filter(majority == "flag")
+
+
+germlinePairedGenotypedStatusDft1 <- germlinePairedGenotypedStatus  %>%
+  filter(!sampleTumor %in% dft2$sampleTumor) %>%
+  distinct(locationAlt, sampleTumor, statusUpdate) %>%
+  group_by(locationAlt, statusUpdate) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(locationAlt) %>%
+  mutate(total_tumors = sum(n),
+         pct = n / total_tumors) %>% 
+  collect()
+
+dt <- as.data.table(germlinePairedGenotypedStatusDft1)
+
+all_status <- c("homRef", "homAlt", "het", "Ref", "Alt", "toCheck")
+
+resultDft1 <- dt[, {
+  # initialize all statuses to 0
+  pct_vec <- setNames(rep(0, length(all_status)), all_status)
+  
+  # fill observed values
+  pct_vec[statusUpdate] <- pct
+  
+  # majority logic
+  max_val <- max(pct_vec)
+  winners <- names(pct_vec)[pct_vec == max_val]
+  majority <- if (length(winners) > 1) "flag" else winners
+  
+  c(
+    list(total_tumors = unique(total_tumors)),
+    as.list(pct_vec),
+    list(majority = majority)
+  )
+}, by = locationAlt]
+
+table(resultDft1$majority)
+
+checkFlagsDft1 <- resultDft1 %>%
+  filter(majority == "flag")
+```
+
+### 3.1.5 Load genotyper results 
+- Filter on conditions of interest
+```{r}
+germlinePairedInformative<- open_dataset(paste0(resDir, "germlineGenotyper/")) %>%
+  filter(
+    (nTumorAltGtyrMapped > 0 & nHostAltGtyrMapped == 0) |
+    (nTumorRefGtyrMapped > 0 & nHostRefGtyrMapped == 0) |
+    (nHostAltGtyrMapped > 0 & nTumorAltGtyrMapped == 0) |
+    (nHostRefGtyrMapped > 0 & nTumorRefGtyrMapped == 0)
+  ) 
+
+# > nrow(germlinePairedInformative)
+# [1] 21168207
+
+germlinePairedInformative <- write_dataset(germlinePairedInformative,
+                                           path = paste0(resDir,
+                                                         "germlineInformative/"),
+  format = "parquet",
+  partitioning = "sampleTumor")
+
+
+gc()
+
+germlinePairedInformative <- open_dataset(paste0(resDir, "germlineInformative/")) %>%
+  collect()
+```
+
+## 3.3 Merge tumor AlCo with germline vcf information.
+- Join filtered vcf file with AlCo results from tumor RNAseq.
+- Of note, NOT all samples have an associated RNA-seq file! See metadata script.
+- Filtering AlCoDf for any rows where expression > 0. If an informative position has 0 RNAseq reads assigned, the expression of the informative allele is 0. 
+
+dim(joined) --> i.e., 2 million germline variants with an informative allele for which we also have RNAseq data.
+[1] 21164054       33
+```{r}
+germlinePairedInformativeMatched <- open_dataset(paste0(resDir,
+                                                        "germlineInformative/")) %>%
+  filter(sampleTumor %in% metadata$tumorId)
+
+# 58,966,002 rows.
+germlineAlCoDfFiltered <- open_dataset(paste0(resDir, "germlineAlCoDfFiltered/")) %>%
+  dplyr::select(c(tumorLocationAlt,
+                  tumorIdRnaSeq, 
+                  TOTAL,
+                  NREF, 
+                  NALT)) 
+
+joined <- germlinePairedInformativeMatched %>%
+  left_join(germlineAlCoDfFiltered, 
+            by = "tumorLocationAlt") %>%
+  mutate(POS = as.numeric(POS))
+
+write_dataset(joined, 
+              paste0(resDir, "germlineAlCoVarsJoined/"),
+              format = "parquet",
+              partitioning = "sampleTumor")
+
+# [1] 1346513
+# joinedInform <- open_dataset(paste0(resDir, "germlineAlCoVarsJoined/")) %>%
+#   filter(TOTAL > 0) %>%
+#   collect()
+# 
+# nrow(joinedInform)
+```
+
+## 3.3 GTF annotations
+### 3.3.1 Annotate CHROM:POS
+- From informative file, get all CHROM and POS. 
+- Merge with gtf file on informative positions (exons)
+
+```{r}
+# > nrow(joinedChromPos)
+# [1] 1018330
+
+joinedChromPos <- joined %>%
+  dplyr::select(CHROM, POS) %>%
+  distinct() %>%
+  collect()
+
+gc()
+
+gtfFile <- "~/gitClones/01_Deconvolution/02_Deconvolution_DFT1/020_Data/RFS/Sarcophilus_harrisii.mSarHar1.11.115.gtf"
+
+gtf <- import(gtfFile)
+
+genes <- gtf[gtf$type == "gene"]
+
+exons <- gtf[gtf$type == "exon"]
+
+genes <- genes[genes$gene_biotype == "protein_coding"]
+
+variants <- GRanges(
+  seqnames = joinedChromPos$CHROM,
+  ranges = IRanges(start = joinedChromPos$POS, 
+                   end = joinedChromPos$POS)
+)
+
+# Which variants fall in an exon
+exonHits <- findOverlaps(variants, exons)
+
+# Map exon hits to gene IDs
+exonGeneIds <- exons$gene_id[subjectHits(exonHits)]
+exonGeneNames <- exons$gene_name[subjectHits(exonHits)]
+exonBiotypes <- exons$gene_biotype[subjectHits(exonHits)]
+
+hitsDf <- data.frame(
+  query = queryHits(exonHits),
+  gene_id = exonGeneIds,
+  gene_name = exonGeneNames,
+  biotype = exonBiotypes
+)
+
+collapseFun <- function(x) paste(unique(x), collapse = ";")
+
+collapsed <- aggregate(. ~ query, 
+                       data = hitsDf, 
+                       FUN = collapseFun)
+
+collapsed$CHROM <- joinedChromPos$CHROM[collapsed$query]
+collapsed$POS   <- joinedChromPos$POS[collapsed$query]
+```
+
+### 3.3.2 Join with AlCo + Germline Info
+```{r}
+joinedAnno <- open_dataset(paste0(resDir, "germlineAlCoVarsJoined/")) %>%
+  left_join(collapsed)
+
+write_dataset(joinedAnno, 
+              paste0(resDir, "germlineAlCoVarsJoinedAnno/"),
+              format = "parquet",
+              partitioning = "sampleTumor")
+
+# Checking. All positions should have been queried, thus should return 0 rows? No, returns 20815775 rows, because exon hits only contains variant hits. 
+# nrow(joinedAnnoFiltered %>% filter(is.na(query)==T))
+# [1] 348,279 rows in an informative regions!
+# joinedAnnoFiltered <- joinedAnno %>%
+#   collect() %>%
+#   filter(is.na(query)==F)
+```
+
+# 4. Normalize nRef and nAlt
+## 4.1 Calculate size factors
+- Of note, sample 1538T1 was not filtered out properly, we don't have matched RNAseq data for this sample. Excluding here but need to go back and filter this. 
+```{r}
+joinedAnnoFiltered <- open_dataset(paste0(resDir, "germlineAlCoVarsJoinedAnno/")) %>%
+  mutate(locationAlt = paste0(CHROM, ":", POS, "_", REF, ALT)) %>%
+  filter(is.na(query)==F) %>%
+  filter(is.na(TOTAL)==F) %>%
+  collect()
+
+# nrow(joinedAnnoFiltered)
+# [1] 341547
+```
+
+### 4.1.1 Calculate size factors for all variant positions
+- Using TOTAL at each variant position, compute size factors per sample. 
+```{r}
+dt <- copy(as.data.table(joinedAnnoFiltered))
+
+dt[, samplename := sampleTumor]
+
+# remove variants with zero coverage everywhere
+dt[, empty := sum(TOTAL, na.rm = TRUE) == 0, by = locationAlt]
+variants <- dt[empty == FALSE]
+
+# geometric means per variant
+gmeans <- variants[, .(gmean = geomean(TOTAL + 1)), by = locationAlt]
+
+setkey(gmeans, locationAlt)
+setkey(variants, locationAlt)
+
+variants[gmeans, gmean := i.gmean]
+
+# ratios
+variants[, scaled_total := TOTAL / gmean]
+
+# size factors
+size_factors <- variants[, .(
+  size_factor = median(scaled_total, na.rm = TRUE)
+), by = samplename]
+
+setkey(size_factors, samplename)
+
+dt[size_factors, on = "samplename", size_factor := i.size_factor]
+
+dt[, `:=`(
+  NREF_norm = NREF / size_factor,
+  NALT_norm = NALT / size_factor,
+  TOTAL_norm = TOTAL / size_factor
+)]
+
+dt <- dt %>%
+  mutate(variantType = "germline")
+
+
+write_dataset(dt, 
+              paste0(resDir, "germlineAlCoVarsJoinedAnnoNorm/"),
+              format = "parquet",
+              partitioning = "sampleTumor")
+```
+
+### 4.1.2 Calculate size factors for variant positions present in all tumors only
+- No variants are shared by all tumors (nrow(chosen) = 0), thus no NREF_norm_all/NALT_norm_all.
+- Not compatible with DFT1/DFT2 so leaving this out for now, potentially revisit!
+```{r}
+# n_samples <- uniqueN(dt$samplename)
+# 
+# chosen <- dt[TOTAL > 0,
+#              .N, by = locationAlt][N == n_samples]
+# 
+# variants_all <- dt[locationAlt %in% chosen$locationAlt]
+# 
+# gmeans_all <- variants_all[, .(gmean = geomean(TOTAL + 1)),
+#                            by = locationAlt]
+# 
+# variants_all[gmeans_all, on = "locationAlt", gmean := i.gmean]
+# variants_all[, scaled_total := TOTAL / gmean]
+# 
+# size_factors_all <- variants_all[, .(
+#   size_factor_all = median(scaled_total, na.rm = TRUE)
+# ), by = samplename]
+# 
+# dt[size_factors_all, on = "samplename",
+#    size_factor_all := i.size_factor_all]
+# 
+# dt[, `:=`(
+#   NREF_norm_all = NREF / size_factor_all,
+#   NALT_norm_all = NALT / size_factor_all
+# )]
+```
+
+## 4.2 Normalize expression by copy number of informative variant
+
+## 4.3 Compute eT and eH
+
+
