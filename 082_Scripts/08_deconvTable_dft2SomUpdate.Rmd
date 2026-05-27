@@ -245,7 +245,6 @@ dft2Purities <- dft2Purities[-1, ]
 ```{r}
 metadata <- read.xlsx(paste0(resDir,
                           "08_deconvTable_metadata_purityIrodsMergedManualEdit.xlsx")) %>%
-  filter(mapping==1)  %>%
               dplyr::rename("tumorId"="TUMOUR.INFORMATION_TUMOUR.ID", 
                      "tumorIdRnaSeq"="rnaSeqManual")
 ```
@@ -359,9 +358,11 @@ dft2SomLongVaf <- dft2SomLong %>%
                          1,
                          ploidy))
 
-table(dft2SomLongVaf$ploidy)
-  #    1      2      4 
-  # 7340 218466  18350 
+table(dft2SomLongVaf$ploidy, dft2SomLongVaf$sex)
+  #  female   male
+  # 1   1351   7340
+  # 2  34625 182490
+  # 4      0  18350
 ```
 
 ## 2.2 Adjust ploidy at variant using CNV status. 
@@ -396,26 +397,7 @@ check <- which(table(dft2CnvJoin$tumorLocation)>1)
 checkAlt <- which(table(dft2CnvJoin$tumorLocationAlt)>1)
 
 ## Reconstruct table but keep all variants, even when presence == 0, because these are instances where no CNV exists at that variant. 
-dft2CnvJoinMultiplets <- dft2SomLongVaf %>%
-  left_join(
-    dft2CnvLong,
-    by = join_by(
-      CHROM,
-      tumor,
-      position >= START,
-      position <= END
-    )
-  ) %>%
-  # filter(presence > 0) %>%
-  distinct() %>%
-  mutate(tumorLocation = paste0(tumor, 
-                                "_", 
-                                location), 
-         tumorLocationAlt = paste0(tumor, 
-                                "_", 
-                                location, 
-                                "_", 
-                                ALT))  %>%
+dft2CnvJoinMultiplets <- dft2CnvJoin %>%
   mutate(multiplets = ifelse(tumorLocation %in% names(check), 
                 1, 
                 0), 
@@ -709,14 +691,20 @@ dft2SomCnvCorrected <- rbind(dft2CnvJoinNoChanges,
          hostObsTotal = 0,
          nTumorRef = NA, 
          nTumorAlt = NA, 
+         # Have accounted for DFT2 tumors with 1 copy of X and Y due to male origin prior to CN variation changes. 
          tumorPloidy = as.numeric(copyNumberAdjusted)) %>%
+  
   distinct() 
 
-saveRDS(dft2SomCnvCorrected, 
-        paste0(resDir, fprefix, "_dft2SomCnvCorrected.rds"))
+# saveRDS(dft2SomCnvCorrected, 
+#         paste0(resDir, fprefix, "_dft2SomCnvCorrected.rds"))
+# 
+# table(dft2SomCnvCorrected$tumorPloidy)
+# table(dft2SomCnvCorrected$hostPloidy)
 
-table(dft2SomCnvCorrected$tumorPloidy)
-table(dft2SomCnvCorrected$hostPloidy)
+# 137 variants. 
+check <- dft2SomCnvCorrected %>%
+  filter(tumorPloidy == 0) 
 ```
 
 
@@ -730,20 +718,15 @@ table(dft2SomCnvCorrected$hostPloidy)
 - My function
 - Save partitioned data
 ```{r}
-dft2SomCnvCorrected <- readRDS(paste0(resDir, fprefix, "_dft2SomCnvCorrected.rds"))
+# dft2SomCnvCorrected <- readRDS(paste0(resDir, fprefix, "_dft2SomCnvCorrected.rds"))
 
 chunk_size <- 5e3  # adjust to your RAM
 
 dft2SomGenotyped <- dft2SomCnvCorrected %>%
-  mutate(tAlt = computeTAlt(obsVaf, 
-                            purityTumor, 
-                            tTotal = tumorPloidy, 
-                            hTotal = hostPloidy, 
-                            hAlt = nHostAlt), 
-         nTumorAlt = round(tAlt),
-         nTumorRef = tumorPloidy-nTumorAlt, 
-         rowId = row_number(), 
-         chunk_id = (rowId - 1) %/% chunk_size) 
+  filter(tumorPloidy > 0) %>%
+  mutate(
+         rowId = row_number(),
+         chunk_id = (rowId - 1) %/% chunk_size)
 
 gc()
 
@@ -753,6 +736,9 @@ write_dataset(
   format = "parquet",
   partitioning = "chunk_id"
 )
+
+table(dft2SomGenotyped$tumorPloidy
+      )
 ```
 
 ### 3.1.2 Run genotyper()
@@ -866,7 +852,7 @@ plan(sequential)
 ### 3.1.4 Filter on conditions of interest
 - Mutate so that nHostAltGtyrMapped is always 0 and nTumorRefGtyrMapped is 1 or 2.
 ```{r}
-dft2SomGenotypedInformative <- open_dataset(paste0(resDir, "dft2SomGenotyper/")) %>%
+dft2SomGenotypedInformative <- open_dataset(paste0(resDir, "dft2SomGenotyperSom/")) %>%
   mutate(nHostAlt = 0, 
          nHostRef = hostPloidy) %>%
   filter(
@@ -889,7 +875,7 @@ dft2SomInformative <- open_dataset(paste0(resDir, "dft2SomInformative/")) %>%
   collect()
 
 # > nrow(dft2SomGenotypedInformative)
-# [1] 48621
+# [1] 60101
 ```
 
 

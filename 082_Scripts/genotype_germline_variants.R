@@ -63,13 +63,17 @@ genotyper <- function(host_ploidy,
   grid$loglik <- mapply(ll, grid$g_host, grid$g_tumour)
   
   # normalise the likelihoods to get "posterior prob" (no explicit prior)
-  logZ <- logsumexp(grid$loglik)
-  grid$posterior <- exp(grid$loglik - logZ)
+  logZ <- logsumexp(grid$loglik) # normalizing factor
+  grid$posterior <- exp(grid$loglik - logZ) # prob of each grid parameter given log likelihoods 
   
   # MAP := outcome with maximum posterior prob
-  map_idx <- which.max(grid$loglik)
+  map_idx <- which.max(grid$loglik) # maximum probability = most likely scenario. --> will max posterior always == max loglikelihood?
   map <- grid[map_idx, ]
-  
+# 
+#   if(which.max(grid$posterior)!=which.max(grid$loglik)){
+#     print(paste0("Check this combination of variables, "))
+#   }
+#   
   # expected values := probability-weighted average of genotypes
   expected_host_alt_alleles <- sum(grid$g_host * grid$posterior)
   expected_tumour_alt_alleles <- sum(grid$g_tumour * grid$posterior)

@@ -1,0 +1,1229 @@
+---
+title: "08_deconvTable_readVariants"
+author: "IMEV2"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# 0 Environment
+## 0.1 Packages
+```{r}
+# install.packages("slider")
+```
+
+### 0.1.1 Library
+```{r echo=F, message=F, warning=FALSE}
+set.seed(123)
+library(tidyverse)
+library(openxlsx)
+library(dplyr)
+library(ggrepel)
+library(RColorBrewer)
+library(pheatmap)
+library(data.table)
+library(GenomicFeatures)
+library(rtracklayer)
+library(GenomicRanges)
+library(data.table)
+library(arrow)
+library(furrr)
+library(patchwork)
+library(slider)
+```
+
+## 0.2 Paths
+```{r echo=F, message=FALSE, warning=FALSE}
+wDir <- paste0("~/gitClones/08_deconvTable/")
+fprefix <- "08_deconvTable_germline"
+dataDir <- paste0(wDir, "/081_Data/")
+resDir <- paste0(wDir, "/083_Results/")
+dir.create(resDir)
+plotDir <- paste0(wDir, "/084_Plots/", fprefix, "/")
+dir.create(plotDir)
+source("~/gitClones/08_deconvTable/082_Scripts/genotype_germline_variants.R")
+histoDir <- paste0(plotDir, 
+                   "histo/")
+dir.create(histoDir)
+barDir <- paste0(plotDir, 
+                 "bar/")
+dir.create(barDir)
+
+resDirOut <- paste0(resDir, "/dft2GermlineVariants/")
+dir.create(resDirOut)
+
+
+```
+
+## 0.3 Custom functions
+### 0.3.1 Compute tAlt
+```{r}
+computeTAlt <- function(obsVaf, 
+                         purityTumor, 
+                         tTotal, 
+                         hTotal, 
+                         hAlt) {
+  
+    print("Solving for tAlt.")
+    denominator = purityTumor*tTotal + (1-purityTumor)*hTotal
+    tAlt = ((obsVaf*denominator)-(1-purityTumor)*hAlt)/purityTumor
+  return(tAlt)
+}
+
+assign_nAlt_from_vaf <- function(vaf, total_cn) {
+  
+  if (is.na(total_cn) || is.na(vaf)) return(NA_integer_)
+  
+  if (total_cn == 0) return(0)
+  
+  if (total_cn == 1) {
+    return(ifelse(vaf < 0.5, 0, 1))
+  }
+  
+  if (total_cn == 2) {
+    if (vaf < 0.25) return(0)
+    else if (vaf < 0.75) return(1)
+    else return(2)
+  }
+  
+  if (total_cn == 3) {
+    if (vaf < 0.15) return(0)
+    else if (vaf < 0.5) return(1)
+    else if (vaf < 0.82) return(2)
+    else return(3)
+  }
+  
+  if (total_cn == 4) {
+    if (vaf < 0.12) return(0)
+    else if (vaf < 0.39) return(1)
+    else if (vaf < 0.64) return(2)
+    else if (vaf < 0.86) return(3)
+    else return(4)
+  }
+  
+  return(NA_integer_)  # fallback
+}
+```
+### 0.3.2 Compute hAlt
+```{r}
+computeHAlt <- function(obsVaf, 
+                         purityTumor, 
+                         tTotal, 
+                         tAlt,
+                         hTotal) {
+  
+  # Cases where hAlt = 0, solve for tAlt
+ 
+    print("Solving for hAlt.")
+    denominator = purityTumor*tTotal + (1-purityTumor)*hTotal
+    hAlt = (obsVaf*denominator)/(1-purityTumor)
+  return(hAlt)
+}
+
+computeHAlt(obsVaf = 0.5, 
+            purityTumor = 0.8, 
+            tTotal = 4, 
+            hTotal = 2, 
+            tAlt=0)
+
+
+
+```
+### 0.3.3 Geometric mean
+- Kevin's scripts
+  - To calculate size factors: 
+  - Compute the geom.mean of totals for each variant (optional: add pseudocount)
+  - Divide each variant's read total by the geometric mean for each variant
+  - Then take the median of these ratios for each sample
+  - (Optional) restrict to variants with presence in all tumors
+```{r}
+geomean <- function(x) {
+  if (all(x == 0)) {
+    NA_real_
+  } else {
+    exp(mean(log(x[x > 0])))
+  }
+}
+```
+
+### 0.3.4 Summarize germline variants
+```{r}
+library(dplyr)
+library(tidyr)
+
+library(data.table)
+
+summarise_variants_dt <- function(df) {
+  dt <- as.data.table(df)
+  
+  # ensure uniqueness per tumor per location
+  dt <- unique(dt[, .(locationAlt, sampleTumor, statusUpdate)])
+  
+  # count per location + status
+  counts <- dt[, .N, by = .(locationAlt, statusUpdate)]
+  
+  # total tumors per location
+  totals <- dt[, .(total_tumors = uniqueN(sampleTumor)), by = locationAlt]
+  
+  # merge counts with totals
+  counts <- counts[totals, on = "locationAlt"]
+  
+  # compute percentage
+  counts[, pct := N / total_tumors]
+  
+  # reshape wide (one column per statusUpdate)
+  wide <- dcast(
+    counts,
+    locationAlt + total_tumors ~ statusUpdate,
+    value.var = "pct",
+    fill = 0
+  )
+  
+  # compute majority
+  status_cols <- setdiff(names(wide), c("locationAlt", "total_tumors"))
+  
+  wide[, majority := {
+    vals <- unlist(.SD)
+    max_val <- max(vals)
+    winners <- names(vals)[vals == max_val]
+    
+    if (length(winners) > 1) "flag" else winners
+  }, by = locationAlt, .SDcols = status_cols]
+  
+  return(wide)
+}
+```
+
+### 0.3.5 P and Q arm adjustment
+```{r, warning=F}
+split_location_ref <- function(location_ref, chrom_lengths_path) {
+  
+  chrom_lengths <- read_tsv(
+    chrom_lengths_path,
+    col_names = c("chrom", "length"),
+  ) %>%
+    dplyr::select(chrom, length)
+  
+  p_arm_lengths <- chrom_lengths %>%
+    filter(grepl("^[0-9]+p$", chrom)) %>%
+    mutate(base = sub("p$", "", chrom)) %>%
+    deframe()
+  
+  names(p_arm_lengths) <- str_replace(names(p_arm_lengths), "p", "")
+  
+  chrom <- sub(":.*", "", location_ref)
+  pos   <- as.numeric(sub(".*:(\\d+)_.*", "\\1", location_ref))
+  ref   <- sub(".*_", "", location_ref)
+  
+  if (chrom %in% names(p_arm_lengths)) {
+    p_len <- p_arm_lengths[[chrom]]
+    if (pos <= p_len) {
+      paste0(chrom, "p:", pos, "_", ref)
+    } else {
+      paste0(chrom, "q:", pos - p_len, "_", ref)
+    }
+  } else {
+    location_ref
+  }
+}
+
+chrom_lengths <- "~/gitClones/08_deconvTable/083_Results/08_deconvTable_sophiaArchivedSamples/dft1Germline/chrom_lengths.tsv"
+
+split_location_ref(location_ref = "1:450172129_C", 
+                   chrom_lengths_path = chrom_lengths)
+
+
+# split_location_ref(location_ref = "1:56076961_G", 
+#                    chrom_lengths_path = chrom_lengths) # A/T
+# 1p:56076961_G
+# 
+# split_location_ref(location_ref = "1:57865046_G", 
+#                    chrom_lengths_path = chrom_lengths) # C/T
+# 1p:57865046_G
+# 
+# split_location_ref(location_ref = "1:58159695_C", 
+#                    chrom_lengths_path = chrom_lengths) # G/T
+# 
+# 1p:58159695_C
+
+# split_location_ref(location_ref = "1:593662106_T",
+#                    chrom_lengths_path = chrom_lengths) # C/G
+# # "1q:306958333_T"
+
+
+
+
+```
+
+# 1 Data
+## 1.1 VCF files
+- Read in germline vcf file
+- Pivot longer so that each variant and each sample is a single row with the ALT/TOTAL ratio.
+```{r}
+# germline <- read_table(paste0(dataDir, "Data_S1D_Tasmanian_devil_germline_variants.txt"),
+#                       col_types = cols(.default = "c"))
+# 
+# sampleInfo <- tibble(sample = colnames(germline)[-(1:4)]) %>%
+#   mutate(
+#     sampleType = str_extract(sample, "T|H"),
+#     tcgId = str_extract(sample, "^[^TH]+")
+#   )
+# 
+# 
+# germlineLong <- germline %>%
+#   filter(nchar(REF) == 1, 
+#          nchar(ALT) == 1) %>%
+#   pivot_longer(
+#     cols = -c(CHROM, POS, REF, ALT),
+#     names_to = "sample",
+#     values_to = "ratio"
+#   ) %>%
+#   left_join(sampleInfo, by = "sample") %>%
+#   transmute(
+#     CHROM,
+#     POS,
+#     REF,
+#     ALT,
+#     tcgId,
+#     sampleType,
+#     ratio,
+#     sample
+#   )
+# 
+# saveRDS(germlineLong,
+#         paste0(resDir,
+#                fprefix,
+#                "_germlineLong.rds"))
+```
+
+## 1.2 Pair tumor/host samples
+- Using shared ID's pivot wider so that the ratio for matched tumor/host samples is side by side.
+- Filter on variants where alt allele is present in only the host or the tumor sample within a pair! --> so that we have info. on tAlt or hAlt at that position.
+- 
+```{r}
+# germlineLong <- readRDS(paste0(resDir,
+#                fprefix,
+#                "_germlineLong.rds"))
+# 
+# tumorSamples <- germlineLong %>%
+#   filter(sampleType == "T") %>%
+#   dplyr::select(c("tcgId", "sample")) %>%
+#   distinct()
+# 
+# 
+# normalSamples <- germlineLong %>%
+#   filter(sampleType == "H") %>%
+#   dplyr::select(c("tcgId", "sample")) %>%
+#   distinct()
+# 
+# pairedSamples <- tumorSamples %>%
+#   inner_join(normalSamples,
+#             by= c("tcgId"))
+# 
+# write.xlsx(pairedSamples, 
+#            paste0(paste0(resDir,
+#                fprefix,
+#                "_germlinePaired.xlsx")))
+# 
+# normal <- germlineLong %>%
+#   filter(sampleType == "H") %>%
+#   dplyr::rename(
+#     vafHost = ratio,
+#     sampleHost = sample
+#   ) %>%
+#   dplyr::select(-sampleType)
+# 
+# tumor <- germlineLong %>%
+#   filter(sampleType == "T") %>%
+#   dplyr::rename(
+#     vafTumor = ratio,
+#     sampleTumor = sample
+#   ) %>%
+#   dplyr::select(-sampleType)
+# 
+# paired <- tumor %>%
+#   inner_join(normal,
+#              by = c("CHROM",
+#                     "POS", "REF", "ALT", "tcgId")) 
+# 
+# pairedNas <- paired %>%
+#   filter(is.na(vafTumor) | is.na(vafHost)) --> 0 rows!
+# 
+# write_dataset(paired,
+#               format = "parquet",
+#         paste0(resDir,
+#                fprefix,
+#                "_germlinePaired/"), 
+#         partitioning = "tcgId")
+# germlinePaired <- open_dataset(paste0(resDir,
+#                                       "_germlinePaired/")) %>%
+#   mutate(
+#     tumorAlt = as.integer(sub("/.*", "", vafTumor)),
+#     tumorTotal = as.integer(sub(".*/", "", vafTumor)),
+#     hostAlt = as.integer(sub("/.*", "", vafHost)),
+#     hostTotal = as.integer(sub(".*/", "", vafHost))
+#   ) %>%
+#   mutate(obsVafTumor = tumorAlt/tumorTotal,
+#          obsVafHost = hostAlt/hostTotal)%>%
+#  mutate(tumorLocationRef = paste0(sampleTumor, "_", CHROM, ":", POS, "_", REF))
+# 
+# write_dataset(germlinePaired,
+#               format = "parquet",
+#               paste0(resDir,
+#                      "germlinePaired/"), 
+#               partitioning = "tcgId")
+germlinePairedTest <- open_dataset(paste0(resDir,
+                                      fprefix,
+                                      "_germlinePaired/")) %>%
+  filter(CHROM %in% c("6") & sampleTumor %in% c("18T")) %>%
+  mutate(POS=as.numeric(POS)) %>%
+  filter(255000000 > POS & POS > 240000000) %>%
+           collect()
+
+germlinePairedTestChr1 <- open_dataset(paste0(resDir,
+                                      fprefix,
+                                      "_germlinePaired/")) %>%
+  filter(CHROM %in% c("1") & sampleTumor %in% c("18T")) %>%
+  mutate(POS=as.numeric(POS)) %>%
+  filter(550000000 > POS & POS > 535000000) %>%
+           collect()
+```
+
+## 1.3 Subset germline vcfs by host, tumor, or shared vaf's.
+- Germline (host+tumour) variants are defined as those with VAF >0.25 in any host.
+- That could mean it has 0 VAF in a given tumor sample, but this was not observed in all samples and is therefore not somatic. 
+- How to account for this when calling "true" informative variants?
+```{r}
+# germlinePairedFiltered <- germlinePaired 
+```
+
+## 1.2 CNVs
+- Any germline variants falling within a CNV event were filtered out, so no need to adjust ploidy! 
+```{r}
+# germlineCnv <- read.xlsx("~/gitClones/07_suppDataPapers/suppScienceMax/science.abq6453_tables_s1_to_s8/science.abq6453_table_s6.xlsx", 
+#                      sheet = "Table S6C", 
+#                      startRow = 3)
+# 
+# germlineCnvLong <- germlineCnv %>%
+#   pivot_longer(-c(1:10),
+#               names_to = "tumor", 
+#               values_to = "presence") %>%
+#   mutate(presence = as.numeric(presence)) %>%
+#   mutate(
+#     START = as.numeric(START),
+#     END = as.numeric(END),
+#     CHROM = as.character(CHROM),
+#     tumor = as.character(tumor)
+#   )
+# 
+# rm(germlineCnv)
+# gc()
+```
+
+
+## 1.3 Purities and ploidy
+```{r}
+germlinePurities <- read.xlsx("~/gitClones/07_suppDataPapers/suppScienceMax/science.abq6453_tables_s1_to_s8/science.abq6453_table_s2.xlsx", 
+                          sheet = 1, 
+                          startRow = 3)
+
+firstRow <- as.character(germlinePurities[1, ])
+
+# Create new column names
+newNames <- ifelse(
+  is.na(firstRow),
+  colnames(germlinePurities),
+  paste0(colnames(germlinePurities), "_", firstRow)
+)
+
+# Assign new names and remove the first row
+colnames(germlinePurities) <- newNames
+germlinePurities <- germlinePurities[-1, ]
+
+germlinePuritiesPloidy <- germlinePurities %>%
+  mutate(ploidy = ifelse(X15_PLOIDY == "diploid",
+                 2, 
+                 ifelse(X15_PLOIDY == "tetraploid", 
+                        4, 
+                        "toCheck") 
+                 )) %>%
+  filter(ploidy != "toCheck") %>%
+  dplyr::rename("sampleTumor"="TUMOUR.INFORMATION_TUMOUR ID", 
+                     "purity"="X14_PURITY (VAF-based)", 
+                "dftType"="X9_LINEAGE") %>%
+              mutate(purity = as.numeric(purity), 
+                     ploidy = as.numeric(ploidy), 
+                     sex=ifelse(HOST.SEX == "♂", 
+                                "male", 
+                                ifelse(HOST.SEX == "♀", 
+                                       "female", 
+                                       "toCheck"))) %>%
+              dplyr::select(sampleTumor, 
+                            ploidy, 
+                            purity, 
+                            sex, 
+                            dftType) 
+  
+table(germlinePuritiesPloidy$sex, germlinePuritiesPloidy$dftType)
+
+males <- germlinePuritiesPloidy %>%
+  filter(sex == "male") 
+
+dft2 <- germlinePuritiesPloidy %>%
+  filter(dftType == "DFT2") 
+```
+
+## 1.4 Allele counter data
+- Check for which tumors + hosts we have run alleleCounter (i.e., for which samples do we have RNAseq)?
+- Capital R = TR
+- a/b = BR
+- Adjust names using metadata! 
+
+### 1.4.1 Metadata
+- Mapping AlCo results to VCF file names
+- FOR now, don't filter where mapping = 1. There are sample names that I am certain match the name in Max's supplementary table. --> do this at the stage where we merge with AlCo results so that everything is genotyped
+  - Filter on na in DFT status column, as these we likely highly host contaminated or non-DFT tumors.
+
+- 
+```{r}
+metadata <- read.xlsx(paste0(resDir,
+                          "08_deconvTable_metadata_purityIrodsMergedManualEdit.xlsx")) %>%
+              dplyr::rename("tumorId"="TUMOUR.INFORMATION_TUMOUR.ID",
+                     "tumorIdRnaSeq"="rnaSeqManual") %>%
+  filter(X9_LINEAGE %in% c("DFT2", 
+                           "DFT2"))
+
+# table(metadata$X9_LINEAGE)
+# 
+# DFT2 DFT2 
+#   78   41 
+
+metadataPairs <- metadata %>%
+  filter(HOST.INFORMATION_HOST.ID!="N/A")
+
+# DFT2 DFT2 
+#   63   37 
+```
+
+### 1.4.2 Read in AlCo results
+- Here, tumorId = the name of the RNAseq file. Need to join this with the metadata table and switch out for the VCF tumor name (Max's supp data.)
+- We have AlCo data from 115 tumors, calling this the tumorRnaSeqId. 
+  - This can be left joined with the paired tumorId from the metadata.
+
+```{r}
+# germlineAlCo <- list.files(paste0(resDir, "/063_Results/06_deconvTable_alCo_germlineRefAltExport"),
+#                           recursive = T)
+# 
+# # Read all files and combine
+# germlineAlCoDf <- rbindlist(lapply(germlineAlCo, function(f) {
+#   # Extract tumor ID between "germlineRefAltExport_" and "_realigned"
+#   tumorIdRnaSeq <- sub(".*germlineRefAltExport_(.+)_realigned.*", "\\1", basename(f))
+# 
+#   # Read file
+#   dt <- fread(paste0(resDir, "/063_Results/06_deconvTable_alCo_germlineRefAltExport/", f),
+#               select = c("CHROM", "POS", "REF", "ALT", "TOTAL", "NREF", "NALT"))
+# 
+#   # Add tumor ID column
+#   dt[, tumorIdRnaSeq := tumorIdRnaSeq]
+# 
+#   return(dt)
+# }))
+# 
+# length(unique(germlineAlCoDf$tumorIdRnaSeq)) # 115 RNAseq samples were genotyped.
+# 
+# length(intersect(germlineAlCoDf$tumorIdRnaSeq, metadata$tumorIdRnaSeq)) # 53 samples for which we have a paired RNAseq-DNAseq file.
+# 
+# chunk_size <- 5e4  # adjust to your RAM
+# 
+# ## Left join metadata
+# germlineAlCoDf <- germlineAlCoDf %>%
+#   mutate(rowId = row_number(),
+#          chunk_id = (rowId - 1) %/% chunk_size) 
+# 
+# write_dataset(
+#   germlineAlCoDf,
+#   path = paste0(resDir, "germlineAlCoDf/"),
+#   format = "parquet",
+#   partitioning = "chunk_id"
+# )
+
+# Perform filtering and mutate on arrow, less memory intensive.
+# Rows left after filter informative samples = 58966002
+# germlineAlCoDfFiltered <- open_dataset(paste0(resDir, "germlineAlCoDf/")) %>%
+#   filter(tumorIdRnaSeq %in% metadata$tumorIdRnaSeq) %>%
+#   left_join(metadata) %>%
+#   # Tumor ID = sample ID from germline vcf.
+#   mutate(tumorLocationRef = paste0(tumorId, "_", CHROM, ":", POS, "_", REF), 
+#          sampleTumor = tumorId) %>%
+#   dplyr::select(-c(tumorId))
+# 
+# write_dataset(
+#   germlineAlCoDfFiltered,
+#   path = paste0(resDir, "germlineAlCoDfFiltered/"),
+#   format = "parquet", 
+#   partitioning = "sampleTumor"
+#   
+# )
+```
+
+### 1.4.3 Adjust tumorId of RNAseq data to match Max's metadata
+- Filter to keep only samples for which we have RNAseq data.
+  - Filter tumorId in AlCo for those in metadata$tumorIdRnaSeq
+- Left join with metadata table, to get the matched tumorId
+- Create new column, tumorId_CHROM_POS_ALT
+- Filter for informative AlCo positions in germlinePaired, otherwise there are too many values in the table (slow to work with).
+  - 53 / 115 tumor samples have matched RNA (need to check this.)
+  - 46/75 samples have an informative variant in the germline vcf file AND a matched RNAseq position. 
+  - /46 have at least one variant with TOTAL AlCo > 0. 
+```{r}
+# setDT(germlineAlCoDf)
+# 
+# # fast filtering
+# germlineAlCoCombined <- germlineAlCoDf[tumorIdRnaSeq %in% metadata$tumorIdRnaSeq] %>%
+#   left_join(metadata %>%
+#               dplyr::select(tumorId, tumorIdRnaSeq))
+# 
+# germlineAlCoCombined[, c("tumorLocation", "tumorLocationRef") := .(
+#   paste0(tumorId, "_", CHROM, ":", POS),
+#   paste0(tumorId, "_", CHROM, ":", POS, "_", REF)
+# )]
+# 
+# saveRDS(germlineAlCoCombined,
+#         paste0(resDir,
+#                fprefix,
+#                "_germlineAlCoCombined.rds"))
+# 
+# germlineAlCoCombined <- readRDS(paste0(resDir,
+#                fprefix,
+#                "_germlineAlCoCombined.rds"))
+# 
+# 
+# germlineAlCoCombinedFiltered <- germlineAlCoCombined[tumorLocationRef %in% germlinePaired$tumorLocationRef]
+# 
+# 
+# saveRDS(germlineAlCoCombinedFiltered,
+#         paste0(resDir,
+#                fprefix,
+#                "_germlineAlCoCombinedFiltered.rds"))
+# 
+# rm(germlineAlCoCombined,
+#    germlineAlCoDf,
+#    germlinePairedFiltered)
+# 
+# gc()
+# 
+# germlineAlCoCombinedFiltered <- readRDS(paste0(resDir, 
+#                fprefix, 
+#                "_germlineAlCoCombinedFiltered.rds")) 
+```
+
+# 3 Construct final table
+## 3.1 Compute genotypes
+- Adjust total CN for X and Y chromosomes in male samples
+- In a pure sample, vafH = 0 + (1)*Halt/(0 + 1*Htotal). Therefore, Halt = vafH*Htotal. 
+- How do deal with ploidy for X and Y in male samples in 
+### 3.1.1 Full dataset
+- If host sample is a male, total CN at sex chromosomes == 1
+- If tumor sample is DFT2, total CN at sex chromosomes == 1 or 2 depending on original ploidy.
+- Don't filter out any of the tumors! Only do this at the stage where we merge with RNAseq data.
+```{r}
+# germlinePairedCheckPairs <- open_dataset(paste0(resDir,
+#                                       "germlinePaired/")) %>%
+#   dplyr::select(sampleTumor,
+#                 sampleHost) %>%
+#   distinct() %>%
+#   collect()
+#
+# setdiff(germlinePairedCheckPairs$sampleTumor, metadataPairs$tumorId)
+# > setdiff(germlinePairedCheckPairs$sampleTumor, metadataPairs$tumorId) --> samples that are paired, but in Max's table have no matched host?
+# [1] "212T"  "340T"  "818T1"
+
+# > setdiff(germlinePairedCheckPairs$sampleHost, metadataPairs$HOST.INFORMATION_HOST.ID)
+# [1] "212H" "340H"
+#
+# germlinePairedGenotyped <- open_dataset(paste0(resDir,
+#                                       "germlinePaired/")) %>%
+#   left_join(germlinePuritiesPloidy) %>%
+#   filter(sampleTumor %in% metadataPairs$tumorId) %>%
+#   mutate(nHostTotal = ifelse(sampleTumor %in% males$sampleTumor & CHROM %in% c("X", "Y"),
+#                              1,
+#                              2),
+#        nTumorTotal = case_when(
+#                     sampleTumor %in% dft2$sampleTumor & CHROM == "Y" ~ 0,          # DFT2 female, no Y
+#                     sampleTumor %in% dft2$sampleTumor & CHROM %in% c("X", "Y") ~ ploidy / 2,  # DFT2 XXYY
+#                     TRUE ~ ploidy
+#                   ))
+#
+#
+# germlinePairedGenotyped <- germlinePairedGenotyped %>%
+#   collect()
+#
+# gc()
+#
+# germlinePairedGenotyped$rowId <- 1:nrow(germlinePairedGenotyped)
+#
+# chunk_size <- 5e4  # adjust to your RAM
+#
+# germlinePairedGenotyped <- germlinePairedGenotyped %>%
+#   mutate(chunk_id = (rowId - 1) %/% chunk_size)
+#
+# gc()
+#
+# write_dataset(
+#   germlinePairedGenotyped,
+#   path = paste0(resDir, "germlinePartitioned/"),
+#   format = "parquet",
+#   partitioning = "chunk_id"
+# )
+#
+#
+# test <- open_dataset(paste0(resDir, "germlinePartitioned/")) %>%
+#   filter(sampleTumor %in% dft2$sampleTumor & CHROM %in% c("Y")) %>%
+#   collect()
+```
+
+### 3.1.3 Run genotyper() in chunks
+- Chunk size = 50,000 rows
+```{r}
+# ds <- open_dataset(paste0(resDir, "germlinePartitioned/"))
+# 
+# plan(multisession, workers = availableCores() - 1)
+# 
+# chunk_ids <- ds %>%
+#   distinct(chunk_id) %>%
+#   collect() %>%
+#   pull()
+# 
+# for (cid in chunk_ids) {
+# 
+#   cat("Processing chunk", cid, "\n")
+# 
+#   chunk <- ds %>%
+#     filter(chunk_id == cid)  %>%
+#     collect()
+# 
+#   if (nrow(chunk) == 0) next
+# 
+#   results <- future_pmap(
+#     .l = list(
+#       chunk$nHostTotal,
+#       chunk$nTumorTotal,
+#       chunk$hostAlt,
+#       chunk$hostTotal,
+#       chunk$tumorAlt,
+#       chunk$tumorTotal,
+#       chunk$purity
+#     ),
+#     .f = function(hp, tp, ha, ht, ta, tt, p) {
+# 
+#       g <- genotyper(hp, tp, ha, ht, ta, tt, p)
+# 
+#       c(g_host = g$E$g_host,
+#         g_tumour = g$E$g_tumour,
+#         map_g_host = g$map[1, "g_host"],
+#         map_g_tumour = g$map[1, "g_tumour"])
+#     }
+#   )
+# 
+#   res <- do.call(rbind, results)
+# 
+#   chunk$nHostAltGtyr <- res[,1]
+#   chunk$nHostAltGtyrRounded  <- round(res[,1])
+#   chunk$nHostRefGtyrRounded <- chunk$nHostTotal - chunk$nHostAltGtyrRounded
+# 
+#   chunk$nTumorAltGtyr <- res[,2]
+#   chunk$nTumorAltGtyrRounded  <- round(res[,2])
+#   chunk$nTumorRefGtyrRounded <- chunk$nTumorTotal - chunk$nTumorAltGtyrRounded
+# 
+#   chunk$nHostAltGtyrMapped <- res[,3]
+#   chunk$nHostRefGtyrMapped <- chunk$nHostTotal - chunk$nHostAltGtyrMapped
+# 
+#   chunk$nTumorAltGtyrMapped <- res[,4]
+#   chunk$nTumorRefGtyrMapped <- chunk$nTumorTotal - chunk$nTumorAltGtyrMapped
+# 
+#   write_parquet(
+#     chunk,
+#     paste0(resDir, "germlineGenotyper/genotyped_chunk_", cid, ".parquet")
+#   )
+# 
+#   rm(chunk, results, res)
+#   gc()
+# }
+# 
+# plan(sequential)
+```
+### 3.1.4 Assign majority genotype 
+#### 3.1.3.1 Annotate
+- Annotate germline status as hom alt, hom ref, or het
+- Check what the majority status is at each position (e.g., are >50% of tumors hom alt?)
+  - Add % column
+  - Add majority assignment
+  - Check, how many ALT alleles 
+```{r}
+chroms <- c(paste0(seq(1,6)))
+
+
+germlinePairedGenotypedStatus <- open_dataset(paste0(resDir, "germlineGenotyper/")) %>%
+  filter(CHROM %in% chroms) %>%
+  mutate(locationRef = paste0(CHROM, ":", POS, "_", REF)) 
+
+# schema(germlinePairedGenotypedStatus)
+
+# Originally flagged, checking what the raw data looks like
+# test <- germlinePairedGenotypedStatus %>%
+#   filter(nTumorAltGtyrMapped > 2) %>%
+#   collect()
+# 
+# nAltAlleles <- germlinePairedGenotypedStatus %>%
+#   filter(sampleTumor %in% dft2$sampleTumor) %>%
+#   dplyr::select(locationRef, ALT, sampleTumor) %>%
+#   distinct() %>%
+#   collect() %>%
+#   group_by(locationRef) %>%
+#   summarise(
+#     nAltAlleles = n_distinct(ALT),
+#     altAlleles = paste(sort(unique(ALT)), collapse = ","),
+#     baseA = ifelse("A" %in% ALT, paste(sampleTumor[ALT == "A"], collapse = ","), NA),
+#     baseC = ifelse("C" %in% ALT, paste(sampleTumor[ALT == "C"], collapse = ","), NA),
+#     baseG = ifelse("G" %in% ALT, paste(sampleTumor[ALT == "G"], collapse = ","), NA),
+#     baseT = ifelse("T" %in% ALT, paste(sampleTumor[ALT == "T"], collapse = ","), NA),
+#     .groups = "drop"
+#   )
+# 
+# write_parquet(nAltAlleles,
+#               paste0(resDir, fprefix, "_dft2Cn2_nAltAlleles.parquet"))
+
+nAltAlleles <- read_parquet(paste0(resDir, fprefix, "_dft2Cn2_nAltAlleles.parquet"))
+
+# Are hom ref/alt or het skewed by multiallelic sites?
+biallelicData <- nAltAlleles %>%
+  filter(nAltAlleles == 1) %>%
+  distinct()
+
+biallelic <- biallelicData %>%
+  pull(locationRef)
+
+# 97 sites. --> explore in IGV
+multiallelicData <- nAltAlleles %>%
+  filter(nAltAlleles > 1) %>%
+  distinct()
+
+multiallelic <- multiallelicData %>%
+  pull(locationRef)
+
+# Why do all tumors get repeated when a multiallelic site?. All have very low read counts supporting alt allele. Using genotyper, none of these positions exceed 0 in germline table. Do all tumors have both copies? Probably, all repeated in the summary table. 
+# testTwo <- germlinePairedGenotypedStatus %>%
+#   filter(locationRef %in% multiallelic) %>%
+#   collect()
+
+rm(nAltAlleles)
+
+germlinePairedMultiallelic <- open_dataset(paste0(resDir, "germlineGenotyper/")) %>%
+  filter(CHROM %in% chroms) %>%
+  mutate(locationRef = paste0(CHROM, ":", POS, "_", REF)) %>%
+  filter(locationRef %in% multiallelic) %>%
+  collect()
+
+write.xlsx(germlinePairedMultiallelic, 
+           paste0(resDir, fprefix, "_germlinePairedMultiallelic.xlsx"))
+
+germlinePairedMultiallelicCheck <- germlinePairedMultiallelic %>%
+  filter(obsVafTumor > .20)
+
+length(unique(germlinePairedMultiallelicCheck$locationRef))
+```
+  
+#### 3.1.3.2 DFT2
+###### ---
+##### 3.1.3.2.2 CN >= 2, all chromosomes, in all tumors. 
+- Autosomal
+- Positions are biallelic
+- Filter for positions where CN >= 2 in all tumors. 
+- Compute number of tumors per variant position
+- Calculate, per genotype, the percentage of tumors in each state
+- Paste the tumors in each state
+- Determline the "majority" state if this exists.
+- Save using arrow, to merge back into large genotype table 
+  - Per tumorLocationRef annotate as "majority/minority/flagged" and paste the majority or "flag" as the genotype. 
+  
+###### 3.1.3.2.1.1 Annotate
+- Annotate each location with the majority (>= 66% status) flipping status
+```{r}
+# Find positions where all tumors have CN >= 2
+positionsCn2All <- germlinePairedGenotypedStatus %>%
+  filter(sampleTumor %in% dft2$sampleTumor & CHROM %in% chroms & locationRef %in% biallelic) %>%
+  group_by(locationRef) %>%
+  summarise(minTumorCn = min(nTumorTotal, na.rm = TRUE), 
+            .groups = "drop") %>%
+  filter(minTumorCn >= 2) %>%
+  dplyr::select(locationRef, minTumorCn) %>%
+  collect()
+
+gc()
+
+length(unique(positionsCn2All$locationRef))
+
+gc()
+
+genotypeDft2Cn2All <- germlinePairedGenotypedStatus %>%
+  ######
+  filter(sampleTumor %in% dft2$sampleTumor & locationRef %in% positionsCn2All$locationRef) %>%
+  ######
+  mutate(status = ifelse(nTumorRefGtyrMapped == nTumorTotal & nTumorAltGtyrMapped == 0, 
+                "homRef", 
+                ifelse(nTumorAltGtyrMapped == nTumorTotal & nTumorRefGtyrMapped == 0, 
+                       "homAlt", 
+                         ifelse(nTumorRefGtyrMapped > 0 & nTumorRefGtyrMapped < nTumorTotal & nTumorAltGtyrMapped > 0 & nTumorAltGtyrMapped < nTumorTotal, 
+                                "het", 
+                                "toCheck")))) %>%
+  dplyr::select(locationRef, 
+                sampleTumor, 
+                status, 
+                CHROM, 
+                POS, 
+                ploidy, 
+                nTumorTotal) %>%
+  collect()
+
+majorityStatusAll <- genotypeDft2Cn2All %>%
+  group_by(locationRef, status) %>%
+  summarise(n = n_distinct(sampleTumor), .groups = "drop") %>%
+  group_by(locationRef) %>%
+  mutate(
+    totalTumors = sum(n),        # total tumors with a call at this position
+    maxN        = max(n),
+    nTied       = sum(n == maxN),
+    propMax     = maxN / totalTumors   # proportion of tumors with majority status
+  ) %>%
+  filter(n == maxN) %>%
+  mutate(majorityStatus = case_when(
+    propMax <= 0.5         ~ "flag",   # no status exceeds 50%, which would support a tie (2 or 3 way). 
+    TRUE                   ~ status
+  )) %>%
+  dplyr::slice(1) %>%
+  ungroup() %>%
+  dplyr::rename(majorityN = n) %>%
+  dplyr::select(locationRef,
+                majorityStatus,
+                majorityN,
+                totalTumors,
+                propMax)           # keep for diagnostics
+
+# table(majorityStatusAll$majorityStatus)
+# 
+# > range(majorityStatusAll$propMax)
+# [1] 0.3650794 1.0000000
+
+# Step 3: Annotate differences
+genotypeDft2Cn2AnnoAll <- genotypeDft2Cn2All %>%
+  # Filter on informative positions
+  filter(locationRef %in% positionsCn2All$locationRef) %>%
+  left_join(majorityStatusAll) %>%
+  mutate(majorityCheck = status == majorityStatus) 
+
+rm(genotypeDft2Cn2All)
+
+# [1] 23 --> to have a majority must be greater than 63/2, i.e., 32. Why is 23 the majority? Possibly because it is > 1/3 of the samples?? Yes. Because 63/3 = 21, so the min between three genotypes is 21 samples. 
+flagsAll <- genotypeDft2Cn2AnnoAll %>%
+  filter(majorityStatus %in% c("flag")) %>%
+  mutate(tumorLocationRef = paste0(sampleTumor, "_", locationRef))
+
+length(unique(flagsAll$locationRef))
+
+table(flagsAll$status, 
+      flagsAll$locationRef)
+
+germlinePairedFlagged <- germlinePairedGenotypedStatus %>%
+  mutate(tumorLocationRef = paste0(sampleTumor, "_", locationRef)) %>%
+  filter(tumorLocationRef %in% flagsAll$tumorLocationRef) %>%
+  collect()
+
+length(unique(germlinePairedFlagged$locationRef))
+
+write.xlsx(germlinePairedFlagged, 
+           paste0(resDirOut, fprefix, "_biallelicCN2AllDft2_germlinePairedFlagged.xlsx"))
+```
+
+###### 3.1.3.2.1.2 Plot - biallelic non-flagged
+```{r}
+cladeOrder <- genotypeDft2Cn2AnnoAll %>%
+  left_join(metadata %>% 
+            dplyr::rename(sampleTumor=tumorId) %>%
+              dplyr::select(sampleTumor, 
+                            HOST.SEX, 
+                            X10_CLADE)) %>%
+  distinct(sampleTumor, X10_CLADE) %>%
+  dplyr::select(sampleTumor, X10_CLADE) %>%
+  arrange(X10_CLADE, sampleTumor) %>%
+  collect() %>%
+  pull(sampleTumor)
+```
+
+####### 3.1.3.2.1.2.1 Histograms - non flagged
+- X axis = # non-majority SNPs
+- What does the distribution look like? I.e., are there many positions with only 1 or 2 flipping SNPs?
+```{r}
+# Count the number of tumors where status was not equal to majorityStatus
+dfPlotAll <- genotypeDft2Cn2AnnoAll %>%
+  filter(majorityCheck == F & majorityStatus!="flag" & locationRef %in% biallelic) %>%
+  # CHROM is redundant but useful for plotting.
+  group_by(locationRef,
+           CHROM) %>%
+  summarise(nTumors = n_distinct(sampleTumor), .groups = "drop")
+
+max(dfPlotAll$nTumors)
+
+histoAll <- ggplot(dfPlotAll,
+                   aes(x = nTumors)) +
+  geom_histogram(binwidth = 1, fill = "steelblue", colour = "white") +
+  labs(
+    x = "Number of DFT2 tumors",
+    y = "Unique non-majority positions (locationRef)",
+    title = "Biallelic Positions with CN >= 2 (All DFT2 Tumors)"
+  ) +
+  theme_minimal()
+
+histoAllChrom <- ggplot(dfPlotAll,
+                   aes(x = nTumors,
+                       fill = CHROM)) +
+  geom_histogram(binwidth = 1,
+                 alpha = 0.75) +
+  labs(
+    x = "Number of DFT2 tumors",
+    y = "Unique non-majority positions (locationRef)",
+    title = "Biallelic Positions with CN >= 2 (All DFT2 Tumors)"
+  ) +
+  theme_minimal()
+
+histoSplitChromFacet <- ggplot(dfPlotAll,
+                   aes(x = nTumors,
+                       fill = CHROM)) +
+  geom_histogram(binwidth = 1,
+                 alpha = 0.75) +
+  facet_wrap(~CHROM,
+             scales = "fixed",
+             ncol = 1) +
+  labs(
+    x = "Number of DFT2 tumors",
+    y = "Unique non-majority positions (locationRef)",
+    title = "Biallelic Positions with CN >= 2 (All DFT2 Tumors)"
+  ) +
+  theme_minimal()
+
+
+histoAllChromZoom <- ggplot(dfPlotAll %>% filter(nTumors > 3),
+                   aes(x = nTumors,
+                       fill = CHROM)) +
+  geom_histogram(binwidth = 1,
+                 alpha = 0.75) +
+  labs(
+    x = "Number of DFT2 tumors (n > 3)",
+    y = "Unique non-majority positions (locationRef)",
+    title = "Biallelic Positions with CN >= 2 (All DFT2 Tumors)"
+  ) +
+  theme_minimal()
+
+
+pdf(paste0(histoDir, fprefix, "_distributionFlippedSnps_biallelicCN2AllDft2.pdf"),
+    height = 4,
+    width = 8)
+
+print(histoAll)
+print(histoAllChrom)
+print(histoAllChromZoom)
+
+dev.off()
+
+pdf(paste0(histoDir, fprefix, "_distributionFlippedSnps_biallelicCN2AllDft2_facet.pdf"),
+    height = 10,
+    width = 8)
+
+print(histoSplitChromFacet)
+
+dev.off()
+
+write.xlsx(histoAll$data %>% as.data.frame() %>% mutate(varType = "biallelicCN2AllDft2"),
+           paste0(resDirOut, fprefix, "_distributionFlippedSnps_biallelicCN2AllDft2.xlsx"))
+```
+
+####### 3.1.3.2.1.2.2 Sliding window - idx = snp position. 
+```{r}
+# Step 1: Prepare the data - flag flipping SNPs and get position
+# allSNPs <- genotypeDft2Cn2AnnoAll %>%
+#   filter(majorityStatus != "flag") %>%
+#   mutate(POS = as.numeric(POS)) %>%
+#   arrange(sampleTumor,
+#           CHROM,
+#           POS) %>%
+#   left_join(metadata %>%
+#             dplyr::rename(sampleTumor=tumorId) %>%
+#               dplyr::select(sampleTumor,
+#                             HOST.SEX,
+#                             X10_CLADE))
+# 
+# write_parquet(allSNPs,
+#               paste0(resDir, fprefix, "_dft2Cn2_allSNPs.parquet"))
+# 
+# Step 2: Sliding window per tumor per chromosome
+windowedFlips <- allSNPs %>%
+  group_by(sampleTumor, CHROM) %>%
+  arrange(POS) %>%
+  mutate(
+    # Slide index allows for irregular SNP positions (i.e., as they cluster in non-uniform manner), indexing by position rather than a set number of Mb.
+    windowCount = slide_index_dbl(
+      majorityCheck,           # counts
+      .i = POS,                # index by position
+      .f = ~ sum(!.x),         # count majority status == F (number of flipping SNPs) per window
+      .before = 50000,         # 50kb each side = 100kb window
+      .after  = 50000
+    )) %>%
+  ungroup()
+
+dim(windowedFlips)
+# 
+# write_parquet(windowedFlips,
+#               paste0(resDir, fprefix, "_dft2Cn2_windowedFlips.parquet"))
+
+allSNPS <- read_parquet(paste0(resDir, fprefix, "_dft2Cn2_allSNPs.parquet"))
+
+windowedFlips <- read_parquet(paste0(resDir, fprefix, "_dft2Cn2_allSNPs.parquet"))
+
+gc()
+
+windowedFlipsFiltered <- windowedFlips %>%
+  filter(windowCount > 0)
+
+rm(windowedFlips)
+
+dim(windowedFlipsFiltered)  
+```
+
+####### 3.1.3.2.1.2.3 Plot sliding window
+```{r}
+library(pracma)
+library(zoo)
+
+# ── 1. Extract peaks per tumor per chromosome ─────────────────────────────────
+peaks <- windowedFlipsFiltered %>%
+  group_by(sampleTumor, CHROM) %>%
+  arrange(POS) %>%
+  group_modify(~ {
+    p <- findpeaks(
+      .x$windowCount,
+      minpeakheight   = mean(.x$windowCount, na.rm = TRUE) + 2 * sd(.x$windowCount, na.rm = TRUE),
+      minpeakdistance = 10
+    )
+    if (is.null(p)) return(tibble())
+    tibble(
+      peak_idx    = p[, 2],
+      windowCount = p[, 1]
+    ) %>%
+      mutate(POS = .x$POS[peak_idx])
+  }) %>%
+  ungroup()
+
+
+# ── 2. Bin peaks into 500kb windows, count tumors sharing each bin ────────────
+bin_size <- 500000  # adjust as needed
+
+sharedPeaks <- peaks %>%
+  mutate(bin = floor(POS / bin_size) * bin_size) %>%
+  group_by(CHROM, bin) %>%
+  summarise(
+    n_tumors    = n_distinct(sampleTumor),
+    tumor_list  = list(unique(sampleTumor)),
+    mean_count  = mean(windowCount),
+    .groups     = "drop"
+  ) %>%
+  filter(n_tumors > 1)   # only keep bins shared by 2+ tumors
+
+
+# ── 3. Join clade info back onto peaks for plotting ───────────────────────────
+# (assumes windowedFlips has X10_CLADE and sampleTumor columns)
+cladeKey <- windowedFlipsFiltered %>%
+  distinct(sampleTumor, X10_CLADE)
+
+peaksWithClade <- peaks %>%
+  left_join(cladeKey, by = "sampleTumor") %>%
+  mutate(sampleTumor = factor(sampleTumor, levels = cladeOrder))
+
+sharedBins <- sharedPeaks %>%
+  mutate(
+    bin_start = bin,
+    bin_end   = bin + bin_size
+  )
+
+# ── 4. Plot per chromosome ────────────────────────────────────────────────────
+for (chr in unique(windowedFlipsFiltered$CHROM)) {
+
+  tempDf <- windowedFlipsFiltered %>%
+    filter(CHROM == chr) %>%
+    # left_join(cladeKey, by = "sampleTumor") %>%
+    mutate(sampleTumor = factor(sampleTumor, 
+                                levels = cladeOrder))
+
+  tempPeaks  <- peaksWithClade  %>% filter(CHROM == chr)
+  tempShared <- sharedBins      %>% filter(CHROM == chr)
+
+  xmax <- max(tempDf$POS, na.rm = TRUE)
+
+  tempPlotClade <- ggplot(tempDf,
+      aes(x = POS, y = windowCount, colour = X10_CLADE)) +
+    # ── shared-peak shading ──────────────────────────────────────────────────
+    geom_rect(
+      data        = tempShared,
+      aes(xmin = bin_start, xmax = bin_end,
+          ymin = -Inf,      ymax = Inf,
+          alpha = n_tumors),
+      inherit.aes = FALSE,
+      fill        = "grey50"
+    ) +
+    scale_alpha_continuous(
+      name   = "Tumors sharing peak",
+      range  = c(0.10, 0.35)
+    ) +
+    # ── sliding-window lines ─────────────────────────────────────────────────
+    geom_line(alpha = 0.6, linewidth = 0.4) +
+    # ── individual peak points ───────────────────────────────────────────────
+    geom_point(
+      data        = tempPeaks,
+      aes(x = POS, 
+          y = windowCount, 
+          colour = X10_CLADE),
+      inherit.aes = FALSE,
+      shape = 25, size = 1.2, stroke = 0.3
+    ) +
+    facet_grid(sampleTumor ~ CHROM, scales = "fixed") +
+    labs(
+      x        = "Genomic position",
+      y        = "Flipping SNPs in 100kb window",
+      colour   = "Clade",
+      title    = "Flipping SNPs — DFT2 Tumors",
+      subtitle = paste0("Chromosome: ", chr,
+                        "  |  Shading = bins shared by ≥2 tumors")
+    ) +
+    scale_x_continuous(
+  breaks = seq(0, xmax, by = 1e7),
+  labels = scales::label_number(scale = 1e-3, suffix = " kb")
+)+
+    theme(
+      legend.position  = "right",
+      strip.text.x     = element_text(size = 7),
+      axis.text.x      = element_text(angle = 45, hjust = 1, size = 6),
+      axis.text.y      = element_text(size = 4)
+    )
+
+  pdf(
+    paste0(barDir, "germlineDft2/biallelicCn2_countFlips/",
+           fprefix, "_chr", chr,
+           "_flippedSnps_biallelicCN2AllDft2_slidingWindow100Kb_sharedPeaks.pdf"),
+    height = 40, width = 35
+  )
+  print(tempPlotClade)
+  dev.off()
+}
+```
+
+####### 3.1.3.2.1.2.4 Correct data
+- Define a peak as any region where 
+
+
