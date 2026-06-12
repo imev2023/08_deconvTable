@@ -98,79 +98,180 @@ genotyper <- function(host_ploidy,
 # Example (host alt = 1/2, tumour alt = 2/2)
 # est <- genotyper(2, 2, 10, 30, 51, 60, 0.4985)
 # est
+# 
+# genotyper_somatic <- function(host_ploidy,
+#                               tumour_ploidy,
+#                               tumour_observed_alt_reads,
+#                               tumour_observed_total_reads,
+#                               tumour_purity,
+#                               eps = 1e-3) {
+#   
+#   # --- sanity ---
+#   if (!is.finite(tumour_ploidy) || tumour_ploidy < 0) {
+#     stop("Invalid tumour ploidy")
+#   }
+#   
+#   tumour_ploidy <- as.integer(tumour_ploidy)
+#   
+#   # --- mixture weight ---
+#   wa <- (1 - tumour_purity) * host_ploidy
+#   wb <- tumour_purity * tumour_ploidy
+#   w <- wb / (wa + wb)
+#   
+#   # host is FIXED: no alt alleles
+#   p_host_raw <- 0
+#   
+#   # --- likelihood over tumour genotypes only ---
+#   g_tumour_vals <- seq(0, tumour_ploidy)
+#   
+#   loglik <- sapply(g_tumour_vals, function(g_tumour) {
+#     
+#     p_tumour_raw <- g_tumour / tumour_ploidy
+#     
+#     p_mixture_raw <- (1 - w) * p_host_raw + w * p_tumour_raw
+#     p_mixture <- pclamp(p_mixture_raw, eps)
+#     
+#     dbinom(tumour_observed_alt_reads,
+#            tumour_observed_total_reads,
+#            prob = p_mixture,
+#            log = TRUE)
+#   })
+#   
+#   # --- normalize ---
+#   logZ <- logsumexp(loglik)
+#   posterior <- exp(loglik - logZ)
+#   
+#   # --- MAP ---
+#   map_idx <- which.max(loglik)
+#   
+#   # --- expectation ---
+#   expected_tumour_alt <- sum(g_tumour_vals * posterior)
+#   
+#   list(
+#     grid = data.frame(
+#       g_host = 0,
+#       g_tumour = g_tumour_vals,
+#       loglik = loglik,
+#       posterior = posterior
+#     ),
+#     logZ = logZ,
+#     w = w,
+#     map = data.frame(
+#       g_host = 0,
+#       g_tumour = g_tumour_vals[map_idx],
+#       loglik = loglik[map_idx],
+#       posterior = posterior[map_idx]
+#     ),
+#     E = list(
+#       g_host = 0,
+#       g_tumour = expected_tumour_alt
+#     ),
+#     params = list(
+#       host_ploidy = host_ploidy,
+#       tumour_ploidy = tumour_ploidy,
+#       tumour_purity = tumour_purity,
+#       eps = eps
+#     )
+#   )
+# }
+# 
+# pclamp <- function(p, eps=1e-3) {
+#   pmin(1-eps, pmax(eps, p))
+# }
+# 
+# logsumexp <- function(x) {
+#   m <- max(x)
+#   m + log(sum(exp(x - m)))
+# }
 
-genotyper_somatic <- function(host_ploidy,
-                              tumour_ploidy,
-                              tumour_observed_alt_reads,
-                              tumour_observed_total_reads,
-                              tumour_purity,
-                              eps = 1e-3) {
-  
-  # --- sanity ---
-  if (!is.finite(tumour_ploidy) || tumour_ploidy < 0) {
-    stop("Invalid tumour ploidy")
+somatic_genotyper <- function(
+    host_ploidy,
+    tumour_ploidy,
+    tumour_observed_alt_reads,
+    tumour_observed_total_reads,
+    tumour_purity,
+    host_alt_prior = NULL,   # optional: named numeric vector over g_host values
+    eps = 1e-3
+) {
+  # --- Host genotype prior ---
+  # If no prior supplied, assume host is homozygous reference (g_host = 0)
+  # i.e., a point mass at 0. This is the standard somatic assumption.
+  # Alternatively pass e.g. c("0"=0.7, "1"=0.2, "2"=0.1) for an autosome.
+  if (is.null(host_alt_prior)) {
+    host_alt_prior <- setNames(
+      c(1, rep(0, host_ploidy)),          # point mass at g_host = 0
+      as.character(seq(0, host_ploidy))
+    )
+  } else {
+    stopifnot(length(host_alt_prior) == host_ploidy + 1)
+    host_alt_prior <- host_alt_prior / sum(host_alt_prior)   # normalise
   }
   
-  tumour_ploidy <- as.integer(round(tumour_ploidy))
-  
-  # --- mixture weight ---
+  # Tumour read fraction at this locus (same mixture model as before)
   wa <- (1 - tumour_purity) * host_ploidy
-  wb <- tumour_purity * tumour_ploidy
-  w <- wb / (wa + wb)
+  wb <-  tumour_purity      * tumour_ploidy
+  w  <- wb / (wa + wb)
   
-  # host is FIXED: no alt alleles
-  p_host_raw <- 0
-  
-  # --- likelihood over tumour genotypes only ---
-  g_tumour_vals <- seq(0, tumour_ploidy)
-  
-  loglik <- sapply(g_tumour_vals, function(g_tumour) {
+  # Log-likelihood for a single (g_host, g_tumour) pair.
+  # No host read likelihood — replaced by log prior on g_host.
+  ll <- function(g_host, g_tumour) {
+    stopifnot(g_host   >= 0 & g_host   <= host_ploidy)
+    stopifnot(g_tumour >= 0 & g_tumour <= tumour_ploidy)
     
-    p_tumour_raw <- g_tumour / tumour_ploidy
+    p_host_raw    <- g_host   / host_ploidy
+    p_tumour_raw  <- g_tumour / tumour_ploidy
     
     p_mixture_raw <- (1 - w) * p_host_raw + w * p_tumour_raw
-    p_mixture <- pclamp(p_mixture_raw, eps)
+    p_mixture     <- pclamp(p_mixture_raw, eps)
     
-    dbinom(tumour_observed_alt_reads,
-           tumour_observed_total_reads,
-           prob = p_mixture,
-           log = TRUE)
-  })
+    log_prior_host <- log(host_alt_prior[as.character(g_host)] + .Machine$double.xmin)
+    
+    log_lik_tumour <- dbinom(
+      tumour_observed_alt_reads,
+      tumour_observed_total_reads,
+      prob = p_mixture,
+      log  = TRUE
+    )
+    
+    log_prior_host + log_lik_tumour
+  }
   
-  # --- normalize ---
-  logZ <- logsumexp(loglik)
-  posterior <- exp(loglik - logZ)
+  # Grid over all (g_host, g_tumour) combinations
+  grid <- expand.grid(
+    g_host   = seq(0, host_ploidy),
+    g_tumour = seq(0, tumour_ploidy)
+  )
   
-  # --- MAP ---
-  map_idx <- which.max(loglik)
+  grid$loglik    <- mapply(ll, grid$g_host, grid$g_tumour)
+  logZ           <- logsumexp(grid$loglik)
+  grid$posterior <- exp(grid$loglik - logZ)
   
-  # --- expectation ---
-  expected_tumour_alt <- sum(g_tumour_vals * posterior)
+  map_idx <- which.max(grid$loglik)
+  map     <- grid[map_idx, ]
+  
+  # Marginal posteriors (collapsing over g_host)
+  # Usually what you actually care about for a somatic caller
+  tumour_marginal <- tapply(grid$posterior, grid$g_tumour, sum)
+  
+  expected_host_alt_alleles   <- sum(grid$g_host   * grid$posterior)
+  expected_tumour_alt_alleles <- sum(grid$g_tumour * grid$posterior)
   
   list(
-    grid = data.frame(
-      g_host = 0,
-      g_tumour = g_tumour_vals,
-      loglik = loglik,
-      posterior = posterior
+    ll               = ll,
+    grid             = grid,
+    logZ             = logZ,
+    w                = w,
+    host_ploidy      = host_ploidy,
+    params           = list(
+      tumour_ploidy  = tumour_ploidy,
+      tumour_purity  = tumour_purity,
+      eps            = eps
     ),
-    logZ = logZ,
-    w = w,
-    map = data.frame(
-      g_host = 0,
-      g_tumour = g_tumour_vals[map_idx],
-      loglik = loglik[map_idx],
-      posterior = posterior[map_idx]
-    ),
-    E = list(
-      g_host = 0,
-      g_tumour = expected_tumour_alt
-    ),
-    params = list(
-      host_ploidy = host_ploidy,
-      tumour_ploidy = tumour_ploidy,
-      tumour_purity = tumour_purity,
-      eps = eps
+    map              = map,
+    tumour_marginal  = tumour_marginal,   # P(g_tumour | data), summed over g_host
+    E                = list(
+      g_host   = expected_host_alt_alleles,
+      g_tumour = expected_tumour_alt_alleles
     )
   )
 }
